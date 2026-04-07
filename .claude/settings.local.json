@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build)",
+      "Bash(grep -n \"msg.type === ''SCAN_SELECTION''\\\\|msg.type === ''RUN_USAGE_SCAN''\" /c/Users/dsara/'Context Checker'/src/code.ts)",
+      "Bash(grep -n \"type: ''START_USAGE_SCAN''\\\\|type: ''WRITE_USAGE_DESCRIPTIONS''\\\\|type: ''RUN_DS_MATURITY''\" /c/Users/dsara/'Context Checker'/src/code.ts)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.svgrepo.com)",
+      "WebFetch(domain:cdn.jsdelivr.net)",
+      "Bash(wc -l src/*.ts)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(xargs sed:*)",
+      "Bash(npm run:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(ls \"C:\\\\Users\\\\dsara\\\\Context Checker\\\\src\"\" 2>&1 && ls \"C:UsersdsaraContext Checkerdist\"\")",
+      "Bash(find '/c/Users/dsara/Context Checker/src' -newer '/c/Users/dsara/Context Checker/dist/manifest.json' -name *.ts -o -name *.html)",
+      "Bash(node -e \":*)",
+      "Bash(grep -v \"^d.*\\\\.$\")",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}

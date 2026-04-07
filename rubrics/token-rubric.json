@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "version": "1.0.0",
+    "description": "Bootstrap rubric for DS maturity scoring",
+    "lastUpdated": "2026-03-02"
+  },
+  "weights": {
+    "namingDepth": 0.15,
+    "descriptionQuality": 0.20,
+    "descriptionUsageAlignment": 0.20,
+    "scopeUsageAlignment": 0.15,
+    "aiParseability": 0.15,
+    "modeCoverage": 0.10,
+    "collectionTier": 0.05
+  }
+}

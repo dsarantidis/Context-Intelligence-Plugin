@@ -1,0 +1,42 @@
+{
+  "name": "DS Context Intelligence",
+  "id": "ds-context-intelligence-mcp",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "https://api.github.com",
+      "http://localhost",
+      "ws://localhost",
+      "ws://localhost:9223",
+      "ws://localhost:9224",
+      "ws://localhost:9225",
+      "ws://localhost:9226",
+      "ws://localhost:9227",
+      "ws://localhost:9228",
+      "ws://localhost:9229",
+      "ws://localhost:9230",
+      "ws://localhost:9231",
+      "ws://localhost:9232"
+    ],
+    "reasoning": "Connects to local MCP server via WebSocket for AI-assisted design system analysis. Supports port range 9223-9232 for multi-instance operation.",
+    "devAllowedDomains": [
+      "https://api.github.com",
+      "http://localhost",
+      "ws://localhost",
+      "ws://localhost:9223",
+      "ws://localhost:9224",
+      "ws://localhost:9225",
+      "ws://localhost:9226",
+      "ws://localhost:9227",
+      "ws://localhost:9228",
+      "ws://localhost:9229",
+      "ws://localhost:9230",
+      "ws://localhost:9231",
+      "ws://localhost:9232"
+    ]
+  }
+}

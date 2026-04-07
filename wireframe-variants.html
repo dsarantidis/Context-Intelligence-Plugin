@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Variant Descriptions — Wireframe</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: #121212;
+    color: #E5E5E5;
+    padding: 20px;
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+  }
+
+  /* ── Shared card ── */
+  .card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 14px;
+    width: 420px;
+  }
+  .label {
+    font-size: 10px; font-weight: 600; color: #6B7280;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-bottom: 10px;
+  }
+  .comp-name { font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 12px; }
+
+  /* ── Option A: Horizontal pill tabs + description below ── */
+  .pill-row {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px;
+  }
+  .pill {
+    font-size: 11px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.04);
+    color: #9CA3AF; cursor: pointer; white-space: nowrap;
+  }
+  .pill.active {
+    background: rgba(124,58,237,0.2);
+    border-color: rgba(124,58,237,0.5);
+    color: #C4B5FD;
+  }
+  .pill.no-desc {
+    border-style: dashed;
+    color: #4B5563;
+  }
+  .variant-desc-box {
+    background: rgba(255,255,255,0.025);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #D1D5DB;
+    line-height: 1.55;
+    min-height: 52px;
+  }
+  .variant-desc-box.empty {
+    color: #4B5563;
+    font-style: italic;
+  }
+
+  /* ── Option B: Flat rows, no toggle — name + description inline ── */
+  .flat-variant {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 6px 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    align-items: start;
+  }
+  .flat-variant:last-child { border-bottom: none; }
+  .flat-variant-name {
+    font-size: 11px; font-weight: 500; color: #9CA3AF;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    padding-top: 1px;
+  }
+  .flat-variant-desc {
+    font-size: 11px; color: #D1D5DB; line-height: 1.5;
+  }
+  .flat-variant-desc.empty {
+    font-size: 10px; color: #4B5563; font-style: italic;
+  }
+
+  /* ── Divider ── */
+  .divider {
+    width: 1px; background: rgba(255,255,255,0.08);
+    align-self: stretch;
+    margin: 0 4px;
+  }
+
+  /* ── Option labels ── */
+  .opt-label {
+    font-size: 10px; font-weight: 700; color: #7C3AED;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 6px;
+  }
+  .opt-label::after {
+    content: ''; flex: 1; height: 1px; background: rgba(124,58,237,0.3);
+  }
+</style>
+</head>
+<body>
+
+<!-- Option A -->
+<div class="card">
+  <div class="opt-label">Option A — pill selector</div>
+  <div class="comp-name">RADD Text Field</div>
+  <div class="label">Variant descriptions</div>
+
+  <div class="pill-row">
+    <div class="pill active">Size=Large, State=Default</div>
+    <div class="pill">Size=Large, State=Hover</div>
+    <div class="pill">Size=Small, State=Default</div>
+    <div class="pill no-desc">Size=Small, State=Error</div>
+    <div class="pill no-desc">Size=Small, State=Disabled</div>
+  </div>
+
+  <div class="variant-desc-box">
+    Default large text field used in forms where the label and input are at full scale. Use when vertical space allows and the form is the primary action on screen.
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- Option B -->
+<div class="card">
+  <div class="opt-label">Option B — flat list</div>
+  <div class="comp-name">RADD Text Field</div>
+  <div class="label">Variant descriptions</div>
+
+  <div class="flat-variant">
+    <div class="flat-variant-name">Size=Large, State=Default</div>
+    <div class="flat-variant-desc">Default large text field. Use when vertical space allows and the form is the primary action.</div>
+  </div>
+  <div class="flat-variant">
+    <div class="flat-variant-name">Size=Large, State=Hover</div>
+    <div class="flat-variant-desc">Interactive hover state. Border highlights to signal focus readiness.</div>
+  </div>
+  <div class="flat-variant">
+    <div class="flat-variant-name">Size=Small, State=Default</div>
+    <div class="flat-variant-desc">Compact variant for dense UIs or secondary forms.</div>
+  </div>
+  <div class="flat-variant">
+    <div class="flat-variant-name">Size=Small, State=Error</div>
+    <div class="flat-variant-desc empty">No description added yet.</div>
+  </div>
+  <div class="flat-variant">
+    <div class="flat-variant-name">Size=Small, State=Disabled</div>
+    <div class="flat-variant-desc empty">No description added yet.</div>
+  </div>
+</div>
+
+</body>
+</html>

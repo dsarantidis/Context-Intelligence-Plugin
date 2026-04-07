@@ -1,0 +1,200 @@
+{
+  "meta": {
+    "version": "2.0.0",
+    "system": "DS Context Intelligence",
+    "designSystem": "3-Tier Token Architecture",
+    "lastUpdated": "2026-02-14",
+    "status": "Full Design System Rules — Hierarchy, Naming, States, Typography"
+  },
+
+  "settings": {
+    "scanOptions": {
+      "type": "radio",
+      "allowEmpty": false,
+      "options": ["components", "variables", "styles"],
+      "errorMessage": "Please select a category to scan (e.g., Components)."
+    }
+  },
+
+  "rules": [
+    {
+      "id": "component_set_missing_description",
+      "when": {
+        "context": "component_set.*",
+        "missing": "description"
+      },
+      "then": {
+        "severity": "critical",
+        "weight": 40,
+        "suggestion": {
+          "type": "text",
+          "source": "high_quality_description_template",
+          "action": "fill_description",
+          "message": "Component set is missing a description. This is vital for DS documentation."
+        }
+      }
+    },
+    {
+      "id": "description_too_short",
+      "when": {
+        "context": "component.*",
+        "conditions": [
+          { "property": "description.length", "lessThan": 30 }
+        ]
+      },
+      "then": {
+        "severity": "warning",
+        "weight": 20,
+        "suggestion": {
+          "type": "text",
+          "source": "high_quality_description_template",
+          "action": "fill_description",
+          "message": "Description is too vague. High-quality descriptions should follow the Purpose/Usage/Avoid pattern."
+        }
+      }
+    },
+    {
+      "id": "variant_missing_unique_description",
+      "when": {
+        "context": "component.*",
+        "conditions": [
+          { "property": "parent.type", "equals": "COMPONENT_SET" },
+          { "property": "description", "missing": true }
+        ]
+      },
+      "then": {
+        "severity": "warning",
+        "weight": 15,
+        "suggestion": {
+          "type": "text",
+          "source": "variant_specific_template",
+          "action": "fill_description",
+          "message": "This variant needs a specific description explaining its unique properties."
+        }
+      }
+    },
+    {
+      "id": "missing_documentation_link",
+      "when": {
+        "context": "component.*",
+        "missing": "documentation_link"
+      },
+      "then": {
+        "severity": "info",
+        "weight": 10,
+        "suggestion": {
+          "type": "url",
+          "action": "add_link",
+          "message": "Consider adding a link to ZeroHeight or Storybook for better handoff."
+        }
+      }
+    },
+    {
+      "id": "component_missing_variant_descriptions",
+      "when": {
+        "context": "component_set.*",
+        "conditions": [
+          { "property": "childCount", "greaterThan": 1 }
+        ]
+      },
+      "then": {
+        "severity": "warning",
+        "weight": 15,
+        "suggestion": {
+          "type": "text",
+          "action": "fill_description",
+          "message": "Component set has multiple variants without individual descriptions. Each variant (Size, State, Type) should describe its unique behavior."
+        }
+      }
+    }
+  ],
+
+  "textSuggestions": {
+    "high_quality_description_template": {
+      "template": "PURPOSE: {purpose}. USAGE: Use when {usage_scenario}. AVOID: {anti_pattern}.",
+      "placeholders": {
+        "purpose": {
+          "button": "to trigger immediate actions and form submissions",
+          "input": "to capture user text input with validation",
+          "card": "to group related content in a contained surface",
+          "modal": "to focus attention on critical decisions or forms",
+          "tooltip": "to provide contextual help without cluttering the interface",
+          "default": "to provide clear visual context and functionality"
+        },
+        "usage_scenario": {
+          "primary": "it's the main call-to-action on the screen",
+          "secondary": "supporting actions are needed alongside the primary",
+          "destructive": "the action may result in data loss or is irreversible",
+          "default": "the specific component logic is required"
+        },
+        "anti_pattern": {
+          "button": "using multiple primary buttons in the same view",
+          "input": "omitting a clear label for the field",
+          "card": "nesting cards inside cards or overloading with too many actions",
+          "default": "using this component for unrelated UI patterns"
+        }
+      }
+    },
+    "variant_specific_template": {
+      "template": "This variant represents the {variant_name} state. Use it specifically for {specific_context}.",
+      "placeholders": {
+        "variant_name": { "property": "name" },
+        "specific_context": {
+          "Large": "high-emphasis areas or mobile layouts",
+          "Small": "dense interfaces and sidebars",
+          "Error": "displaying validation failures",
+          "Disabled": "non-interactive states where the action is unavailable",
+          "Hover": "the interactive feedback when cursor enters the component",
+          "Pressed": "the momentary pressed feedback during click/tap",
+          "Focus": "keyboard navigation and accessibility focus rings",
+          "default": "this specific configuration"
+        }
+      }
+    }
+  },
+
+  "namingConventions": {
+    "_comment": "These conventions are enforced by ds-naming-validator.ts at scan time",
+    "hierarchy": {
+      "tiers": ["Core (Primitive)", "Semantic", "Component / Scheme"],
+      "corePattern": "[Property]/[Intensity] (e.g. neutral/500, brand/Primary Brand Color/100)",
+      "semanticPattern": "[Function]/[Context] (e.g. Background/Surface/Surface Dim, Foreground/Brand)",
+      "componentPattern": "[Component]/[Variant]/[Property]"
+    },
+    "colorScales": {
+      "range": "50–980",
+      "sourceValue": 500,
+      "standardValues": [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 980]
+    },
+    "functionalKeywords": ["Success", "Error", "Warning", "Information"],
+    "toneModifiers": ["Dim", "Bright", "Recessive", "Inverse", "Inverted"],
+    "interactionStates": {
+      "pattern": "[Theme].[Interactive States].[State].[Category].[Token]",
+      "validStates": ["Hover", "Pressed", "Focus", "Disabled", "Visited"]
+    },
+    "typography": {
+      "sizeDescriptors": ["title-L", "title-M", "title-S", "body-L", "body-M", "body-S", "label-L", "label-M", "label-S", "microcopy"],
+      "dimensionPattern": "Core.dimensions.[N] (e.g. Core.dimensions.4 = 16px)"
+    },
+    "breakpoints": {
+      "devices": ["S Mobile", "M Tablet", "L Laptop", "XL Desktop"]
+    },
+    "modes": {
+      "standard": ["Mode 1", "Light", "Dark", "Light Inverted"],
+      "requirement": "Every token must belong to at least one Mode for automatic theming"
+    }
+  },
+
+  "actions": {
+    "primaryButton": {
+      "label": "Apply description",
+      "actionType": "postMessage",
+      "event": "update-node-properties"
+    },
+    "aiAssistant": {
+      "icon": "sparkles",
+      "label": "Suggest Fix",
+      "actionType": "trigger-logic"
+    }
+  }
+}

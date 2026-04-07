@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DS Context Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #121212;
+      color: #E5E5E5;
+      padding: 16px;
+      min-height: 100vh;
+    }
+    #create-figma-plugin { min-height: 200px; }
+  </style>
+</head>
+<body>
+  <div id="create-figma-plugin">
+    <p style="margin:0;">Loading plugin…</p>
+  </div>
+  <script src="ui.js"></script>
+  <script>
+    (function() {
+      var el = document.getElementById('create-figma-plugin');
+      if (el && el.innerHTML.indexOf('Loading') !== -1) {
+        setTimeout(function() {
+          if (el.innerHTML.indexOf('Loading') !== -1) {
+            el.innerHTML = '<p style="margin:0;color:#c00;">Script did not run. Check console.</p>';
+          }
+        }, 2000);
+      }
+    })();
+  </script>
+</body>
+</html>
