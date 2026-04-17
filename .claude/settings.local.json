@@ -17,7 +17,15 @@
       "Bash(find '/c/Users/dsara/Context Checker/src' -newer '/c/Users/dsara/Context Checker/dist/manifest.json' -name *.ts -o -name *.html)",
       "Bash(node -e \":*)",
       "Bash(grep -v \"^d.*\\\\.$\")",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(gh repo:*)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/dsarantidis/JSON-Export/main/code.js\" -o /tmp/json-export-code.js)",
+      "Read(//tmp/**)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/dsarantidis/JSON-Export/main/ui.html\" -o /tmp/json-export-ui.html)",
+      "mcp__5df575ff-418e-4d7a-9949-1cf85876a577__get_design_context",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

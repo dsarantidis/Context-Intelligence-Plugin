@@ -1,5 +1,5 @@
 {
-  "name": "DS Context Intelligence",
+  "name": "Design System Quality Auditor",
   "id": "ds-context-intelligence-mcp",
   "api": "1.0.0",
   "main": "code.js",
@@ -8,8 +8,12 @@
   "documentAccess": "dynamic-page",
   "networkAccess": {
     "allowedDomains": [
+      "https://api.anthropic.com",
+      "https://api.openai.com",
+      "https://generativelanguage.googleapis.com",
       "https://api.github.com",
       "http://localhost",
+      "http://localhost:5000",
       "ws://localhost",
       "ws://localhost:9223",
       "ws://localhost:9224",
@@ -22,10 +26,14 @@
       "ws://localhost:9231",
       "ws://localhost:9232"
     ],
-    "reasoning": "Connects to local MCP server via WebSocket for AI-assisted design system analysis. Supports port range 9223-9232 for multi-instance operation.",
+    "reasoning": "Connects to AI APIs (Anthropic, OpenAI, Google) for description generation, to GitHub for knowledge sync, and to a local MCP server via WebSocket for design system analysis.",
     "devAllowedDomains": [
+      "https://api.anthropic.com",
+      "https://api.openai.com",
+      "https://generativelanguage.googleapis.com",
       "https://api.github.com",
       "http://localhost",
+      "http://localhost:5000",
       "ws://localhost",
       "ws://localhost:9223",
       "ws://localhost:9224",

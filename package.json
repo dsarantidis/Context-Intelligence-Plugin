@@ -4,9 +4,9 @@
   "description": "Design System Context Intelligence for MCP",
   "main": "dist/code.js",
   "scripts": {
-    "build": "npm run build:ui && webpack --mode development && npm run build:manifest",
+    "build": "npm run build:ui && npm run build:manifest",
     "build:manifest": "copy manifest.dist.json dist\\manifest.json",
-    "build:ui": "node scripts/write-version.js",
+    "build:ui": "node scripts/write-version.js && webpack --mode development",
     "clean": "if exist dist rmdir /s /q dist && mkdir dist",
     "rebuild": "npm run clean && npm run build",
     "watch": "webpack --mode development --watch"

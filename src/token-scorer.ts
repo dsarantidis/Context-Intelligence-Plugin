@@ -150,12 +150,7 @@ export function extractTokenSignals(
   let collectionTier: 'primitive' | 'semantic' | 'other' = 'other';
   if (collectionName && collectionName.charAt(0) === '.') {
     collectionTier = 'primitive';
-  } else if (
-    collectionName &&
-    (collectionName.indexOf('Semantic') !== -1 ||
-      collectionName.indexOf('Mode') !== -1 ||
-      collectionName.indexOf('Scheme') !== -1)
-  ) {
+  } else if (collectionName && collectionName.indexOf('Semantic') !== -1) {
     collectionTier = 'semantic';
   }
 

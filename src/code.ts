@@ -36,6 +36,47 @@ import {
   type DSContextInput,
 } from './ds-context-scorer';
 
+// ── Setup Wizard (Foundation Onboarding) ─────────────────────────────────────
+import {
+  generateTonalPalette,
+  generateShadeScale,
+  applyFullConfiguration as wizardApplyFullConfig,
+  readFontFamiliesFromCore,
+  detectFileArchitecture,
+  type WizardConfig,
+} from './setup-wizard';
+import {
+  isBreakpointTypographyStyleName,
+  snapshotTextStyle,
+  getBreakpointTypographyTokenOptions,
+  groupTypographyTokensByStyle,
+  enrichBreakpointTextStyleSnapshots,
+  resolveVariableValueDisplay,
+  formatTypographicFloatDisplay,
+} from './wizard-breakpoint-styles';
+
+// ── RADD System Detector + Architecture Rules ────────────────────────────────
+import { detectRADDSystem, systemLabel, type SystemInfo } from './system-detector';
+import { runFoundationRules, type FigmaVarSlim, type FigmaCollectionSlim, type RuleViolation } from './foundation-rules';
+
+// ── Foundations Onboarding Wizard ────────────────────────────────────────────
+import type { OnboardingDraft, CommitProgress } from './onboarding/state/types';
+import { loadDraft as onbLoadDraft, saveDraft as onbSaveDraft, clearDraft as onbClearDraft } from './onboarding/state/storage';
+import { emptyDraft as onbEmptyDraft } from './onboarding/state/defaults';
+import { autoPlace as onbAutoPlace, parseHexList as onbParseHexList } from './onboarding/lib/autoPlace';
+import { generateMirrorSuggestions as onbMirrorSuggestions } from './onboarding/lib/mirrorSuggestions';
+import { validateAll as onbValidateAll } from './onboarding/lib/validation';
+import { runCommit as onbRunCommit } from './onboarding/commit/commitOrchestrator';
+
+// ── Foundation Description Generator ─────────────────────────────────────────
+import {
+  generateFoundationDescriptions,
+  generateFoundationDescription,
+  validateDescription as validateFoundationDescription,
+  buildRunReport,
+  type FoundationVariable,
+} from './generator/foundationDescriptionGenerator';
+
 // ── Usage Description Generator ──────────────────────────────────────────────
 import { buildVariableRegistry } from './scanner/variableRegistry';
 import { walkDocument } from './scanner/documentWalker';
@@ -71,12 +112,13 @@ import type { MCPKnowledgeResult } from './learning/types';
 const PLUGIN_UI_WIDTH = 500;
 const PLUGIN_UI_HEIGHT_MIN = 300;
 const PLUGIN_UI_HEIGHT_MAX = 900;
-const PLUGIN_UI_HEIGHT_DEFAULT = 900;
+const PLUGIN_UI_HEIGHT_DEFAULT = 750;
 
 figma.showUI(__html__, {
   width: PLUGIN_UI_WIDTH,
   height: PLUGIN_UI_HEIGHT_DEFAULT,
-  themeColors: true
+  themeColors: true,
+  title: 'DS Context Intelligence',
 });
 
 // Start embedded Desktop Bridge so MCP can run while the plugin is open
@@ -423,6 +465,110 @@ function _jex_buildAliasPath(aliasedVar: any, aliasedVarCollection: string | nul
   return normalized.replace(/\//g, '.');
 }
 
+async function _jex_resolveAliasChainValue(initialValue: any): Promise<any> {
+  let currentVal = initialValue;
+  let maxDepth = 16;
+  const seen = new Set<string>();
+  while (currentVal && currentVal.type === 'VARIABLE_ALIAS' && maxDepth-- > 0) {
+    const aliasId = (currentVal as { id?: string }).id;
+    if (!aliasId || seen.has(aliasId)) return null;
+    seen.add(aliasId);
+    const nextVar = await figma.variables.getVariableByIdAsync(aliasId);
+    if (!nextVar) return null;
+    const nextModes = Object.keys(nextVar.valuesByMode || {});
+    if (nextModes.length === 0) return null;
+    currentVal = (nextVar.valuesByMode as Record<string, any>)[nextModes[0]] ?? null;
+  }
+  return currentVal;
+}
+
+async function _jex_extractCollectionsForUI(): Promise<any[]> {
+  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+
+  const variableIdToCollection = new Map<string, string>();
+  collections.forEach(col => {
+    col.variableIds.forEach(vid => variableIdToCollection.set(vid, _jex_stripIcons(col.name)));
+  });
+
+  const sampleVarId = collections[0]?.variableIds[0];
+  let hasAsyncMethod = false;
+  if (sampleVarId) {
+    const v = await figma.variables.getVariableByIdAsync(sampleVarId);
+    hasAsyncMethod = !!(v && typeof (v as any).valuesByModeForCollectionAsync === 'function');
+  }
+
+  const colResults = await Promise.all(collections.map(async col => {
+    const isExtended = !!(col as any).isExtension || !!(col as any).parentVariableCollectionId || !!(col as any).rootVariableCollectionId;
+    const varPairs: { variable: Variable; collectionValues: Record<string, any> }[] = [];
+
+    await Promise.all(col.variableIds.map(async vid => {
+      const variable = await figma.variables.getVariableByIdAsync(vid);
+      if (!variable) return;
+      let collectionValues: Record<string, any>;
+      if (isExtended && hasAsyncMethod) {
+        collectionValues = await (variable as any).valuesByModeForCollectionAsync(col);
+      } else if (isExtended && (col as any).variableOverrides) {
+        const overridesForVar = (col as any).variableOverrides[variable.id];
+        const merged: Record<string, any> = {};
+        col.modes.forEach(mode => {
+          const parentValues = variable.valuesByMode as Record<string, any>;
+          if ((mode as any).parentModeId && overridesForVar?.[mode.modeId] !== undefined) {
+            merged[mode.modeId] = overridesForVar[mode.modeId];
+          } else if ((mode as any).parentModeId && parentValues[(mode as any).parentModeId] !== undefined) {
+            merged[mode.modeId] = parentValues[(mode as any).parentModeId];
+          }
+        });
+        collectionValues = merged;
+      } else {
+        collectionValues = variable.valuesByMode as Record<string, any>;
+      }
+      varPairs.push({ variable, collectionValues });
+    }));
+
+    const variables: any[] = [];
+    const resolvePromises: Promise<void>[] = [];
+
+    varPairs.forEach(pair => {
+      const valuesByMode: Record<string, any> = {};
+      const resolvedValuesByMode: Record<string, any> = {};
+      const aliasInfo: Record<string, any> = {};
+
+      Object.entries(pair.collectionValues).forEach(([mId, val]: [string, any]) => {
+        valuesByMode[mId] = val;
+        if (val && val.type === 'VARIABLE_ALIAS') {
+          resolvePromises.push(
+            figma.variables.getVariableByIdAsync(val.id).then(async aliasedVar => {
+              if (aliasedVar) {
+                const aliasedVarCollection = variableIdToCollection.get(aliasedVar.id);
+                const aliasPath = _jex_buildAliasPath(aliasedVar, aliasedVarCollection || null, col.name, collections as any[]);
+                aliasInfo[mId] = { isAlias: true, aliasPath, aliasedVarId: aliasedVar.id, aliasedVarCollection };
+              }
+              resolvedValuesByMode[mId] = await _jex_resolveAliasChainValue(val);
+            })
+          );
+        } else {
+          resolvedValuesByMode[mId] = val;
+        }
+      });
+
+      variables.push({
+        id: pair.variable.id,
+        name: pair.variable.name,
+        type: pair.variable.resolvedType,
+        valuesByMode,
+        resolvedValuesByMode,
+        aliasInfo,
+        codeSyntax: (pair.variable as any).codeSyntax ?? {}
+      });
+    });
+
+    await Promise.all(resolvePromises);
+    return { name: col.name, modes: col.modes, variables };
+  }));
+
+  return colResults;
+}
+
 function _jex_transformToFinalFormat(rawData: any): { tokens: any; count: number } {
   const output: any = {};
   let tokenCounter = 0;
@@ -504,6 +650,762 @@ function _jex_transformToFinalFormat(rawData: any): { tokens: any; count: number
 }
 
 // ============================================================================
+// TOKEN EXPORT — Token Studio format transformer (ported from JSON Exporter)
+// ============================================================================
+
+function _jex_normalizeFontWeightLiteral(v: any): any {
+  const FONT_WEIGHT_NAME_TO_NUM: Record<string, string> = {
+    thin:'100', extralight:'200', ultralight:'200', light:'300', regular:'400', normal:'400',
+    medium:'500', semibold:'600', demibold:'600', bold:'700', extrabold:'800', black:'900', heavy:'900'
+  };
+  if (v === undefined || v === null) return v;
+  if (typeof v === 'number' && !isNaN(v)) return String(Math.round(v));
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  if (/^\d+(\.\d+)?$/.test(t)) return String(Math.round(parseFloat(t)));
+  const compact = t.replace(/\s+/g, '').toLowerCase();
+  if (FONT_WEIGHT_NAME_TO_NUM[compact] !== undefined) return FONT_WEIGHT_NAME_TO_NUM[compact];
+  const alpha = t.replace(/[^a-zA-Z]/g, '').toLowerCase();
+  if (alpha && FONT_WEIGHT_NAME_TO_NUM[alpha] !== undefined) return FONT_WEIGHT_NAME_TO_NUM[alpha];
+  return v;
+}
+
+function _jex_formatFloatForExport(value: number): string {
+  if (typeof value !== 'number' || isNaN(value)) return String(value);
+  const rounded = Math.round(value * 100000) / 100000;
+  let s = rounded.toString();
+  if (s.indexOf('e') !== -1 || s === 'NaN') s = String(+parseFloat(value.toPrecision(12)));
+  return s;
+}
+
+function _jex_normalizeFontFamilyAliasSegments(str: string): string {
+  return str
+    .replace(/\{font-family\.([^}]+)\}/gi, (_: string, seg: string) => '{font-family.' + seg.toLowerCase() + '}')
+    .replace(/\{fontFamilies\.([^}]+)\}/gi, (_: string, seg: string) => '{fontFamilies.' + seg.toLowerCase() + '}');
+}
+
+function _jex_fixAliasPaths(obj: any): any {
+  if (typeof obj === 'string') {
+    const s = obj.replace(/\{\.core\./g, '{').replace(/\{core\./g, '{');
+    return _jex_normalizeFontFamilyAliasSegments(s);
+  }
+  if (Array.isArray(obj)) return obj;
+  if (typeof obj === 'object' && obj !== null) {
+    const result: any = {};
+    for (const k of Object.keys(obj)) result[k] = _jex_fixAliasPaths(obj[k]);
+    return result;
+  }
+  return obj;
+}
+
+function _jex_fixKeyOrder(obj: any): any {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  if (Object.prototype.hasOwnProperty.call(obj, 'value') && Object.prototype.hasOwnProperty.call(obj, 'type')) {
+    const r: any = { value: obj.value, type: obj.type };
+    for (const k of Object.keys(obj)) if (k !== 'value' && k !== 'type') r[k] = obj[k];
+    return r;
+  }
+  const result: any = {};
+  for (const k of Object.keys(obj)) result[k] = _jex_fixKeyOrder(obj[k]);
+  return result;
+}
+
+function _jex_getFoundationTokenType(pathParts: string[]): string | null {
+  const first = pathParts[0];
+  if (first === 'spacing') return 'spacing';
+  if (first === 'sizing') return 'sizing';
+  if (first === 'radius') return 'borderRadius';
+  if (first === 'strokes') return 'sizing';
+  if (first === 'colours') return 'color';
+  if (pathParts.some(p => p.indexOf('colour') !== -1)) return 'color';
+  return null;
+}
+
+function _jex_fixFoundationTokens(obj: any, pathParts: string[] = []): any {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  if (Object.prototype.hasOwnProperty.call(obj, 'value') && Object.prototype.hasOwnProperty.call(obj, 'type')) {
+    let tokenType = _jex_getFoundationTokenType(pathParts) || obj.type;
+    let tokenValue = obj.value;
+    if (pathParts[0] === 'radius' && tokenValue === 999) tokenValue = '999';
+    const r: any = { value: tokenValue, type: tokenType };
+    for (const k of Object.keys(obj)) if (k !== 'value' && k !== 'type') r[k] = obj[k];
+    return r;
+  }
+  const out: any = {};
+  for (const k of Object.keys(obj)) out[k] = _jex_fixFoundationTokens(obj[k], [...pathParts, k]);
+  return out;
+}
+
+function _jex_fixCoreTokens(obj: any, pathParts: string[] = []): any {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  if (Object.prototype.hasOwnProperty.call(obj, 'value') && Object.prototype.hasOwnProperty.call(obj, 'type')) {
+    const first = pathParts[0];
+    let cType = obj.type;
+    let cValue = obj.value;
+    if (first === 'dimension') { cType = 'dimension'; cValue = typeof cValue === 'number' ? _jex_formatFloatForExport(cValue) : String(cValue); }
+    else if (first === 'letterSpacing') cType = 'letterSpacing';
+    else if (first === 'letter-spacing') cType = 'number';
+    else if (first === 'lineHeights') cType = 'lineHeights';
+    else if (first === 'line-heights') cType = 'number';
+    else if (first === 'textCase' || first === 'text-case') cType = 'textCase';
+    else if (first === 'textDecoration' || first === 'text-decoration') cType = 'textDecoration';
+    else if (first === 'fontFamilies') cType = 'fontFamilies';
+    else if (first === 'font-family') cType = 'text';
+    else if (first === 'fontSize') cType = 'fontSizes';
+    else if (first === 'font-sizes') cType = 'number';
+    else if (first === 'fontWeights') cType = 'fontWeights';
+    else if (first === 'font-weights') cType = 'number';
+    else if (first === 'paragraphSpacing') cType = 'paragraphSpacing';
+    else if (first === 'paragraph-spacing') cType = 'number';
+    else if (first === 'paragraphIndent') cType = 'paragraphIndent';
+    else if (first === 'paragraph-indents') cType = 'number';
+    else if (first && first.startsWith('viewport-')) cType = 'sizing';
+    if (first === 'font-weights' && cValue !== undefined && cValue !== null) cValue = _jex_normalizeFontWeightLiteral(cValue);
+    if (cType === 'number' && typeof cValue === 'number') cValue = _jex_formatFloatForExport(cValue);
+    else if (cType === 'number' && typeof cValue === 'string' && /^-?\d+\.\d+$/.test(String(cValue).trim())) {
+      const cn = parseFloat(cValue); if (!isNaN(cn)) cValue = _jex_formatFloatForExport(cn);
+    }
+    const res: any = { value: cValue, type: cType };
+    for (const k of Object.keys(obj)) if (k !== 'value' && k !== 'type') res[k] = obj[k];
+    return res;
+  }
+  const out: any = {};
+  for (const k of Object.keys(obj)) {
+    let outKey = k;
+    if (pathParts.length === 1 && (pathParts[0] === 'font-family' || pathParts[0] === 'fontFamilies')) outKey = k.toLowerCase();
+    out[outKey] = _jex_fixCoreTokens(obj[k], [...pathParts, k]);
+  }
+  return out;
+}
+
+function _jex_fixBreakpointTypes(obj: any, pathParts: string[] = []): any {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  if (Object.prototype.hasOwnProperty.call(obj, 'value') && Object.prototype.hasOwnProperty.call(obj, 'type')) {
+    const first = pathParts[0];
+    let t = obj.type, v = obj.value;
+    if (first === 'spacing') t = 'spacing';
+    else if (first === 'sizing') t = 'sizing';
+    else if (t === 'string') t = 'text';
+    const lastSeg = pathParts[pathParts.length - 1];
+    if (lastSeg === 'weight' || first === 'font-weights' || first === 'fontWeights') { v = _jex_normalizeFontWeightLiteral(v); t = 'number'; }
+    if (t === 'number' && typeof v === 'number') v = _jex_formatFloatForExport(v);
+    return { value: v, type: t };
+  }
+  const result: any = {};
+  for (const k of Object.keys(obj)) result[k] = _jex_fixBreakpointTypes(obj[k], [...pathParts, k]);
+  return result;
+}
+
+function _jex_addTypographyComposite(scaleObj: any, scaleName: string): any {
+  if (!scaleObj || typeof scaleObj !== 'object') return scaleObj;
+  const cv: any = {};
+  const addProp = (cvKey: string, scaleKey: string) => {
+    const prop = scaleObj[scaleKey];
+    if (prop && prop.value !== undefined) {
+      const pv = prop.value;
+      cv[cvKey] = typeof pv === 'number' ? _jex_formatFloatForExport(pv) : String(pv);
+    }
+  };
+  addProp('fontFamily', 'font-family');
+  addProp('fontWeight', 'weight');
+  addProp('lineHeight', 'line-height');
+  addProp('fontSize', 'size');
+  addProp('letterSpacing', 'letter-spacing');
+  addProp('paragraphSpacing', 'paragraph-spacing');
+  addProp('paragraphIndent', 'paragraph-indent');
+  if (cv.fontWeight !== undefined) cv.fontWeight = _jex_normalizeFontWeightLiteral(cv.fontWeight);
+  cv.textCase = '{textCase.none}';
+  cv.textDecoration = '{textDecoration.none}';
+  const rebuilt: any = {};
+  rebuilt[scaleName] = { value: cv, type: 'typography' };
+  for (const propKey of ['size','line-height','weight','letter-spacing','font-family','paragraph-spacing','paragraph-indent','text-case','text-decoration']) {
+    if (scaleObj[propKey]) rebuilt[propKey] = scaleObj[propKey];
+  }
+  if (!rebuilt['text-case'] && scaleObj.textCase) rebuilt['text-case'] = scaleObj.textCase;
+  if (!rebuilt['text-decoration'] && scaleObj.textDecoration) rebuilt['text-decoration'] = scaleObj.textDecoration;
+  if (rebuilt.weight && rebuilt.weight.value !== undefined) rebuilt.weight = { value: _jex_normalizeFontWeightLiteral(rebuilt.weight.value), type: 'number' };
+  if (!rebuilt['font-family'] && cv.fontFamily) rebuilt['font-family'] = { value: cv.fontFamily, type: 'text' };
+  if (!rebuilt['paragraph-spacing'] && cv.paragraphSpacing) rebuilt['paragraph-spacing'] = { value: cv.paragraphSpacing, type: 'number' };
+  if (!rebuilt['paragraph-indent'] && cv.paragraphIndent) rebuilt['paragraph-indent'] = { value: cv.paragraphIndent, type: 'number' };
+  if (!rebuilt['text-case']) rebuilt['text-case'] = { value: '{textCase.none}', type: 'textCase' };
+  if (!rebuilt['text-decoration']) rebuilt['text-decoration'] = { value: '{textDecoration.none}', type: 'textDecoration' };
+  return rebuilt;
+}
+
+function _jex_fixBreakpointTypography(typObj: any): any {
+  if (!typObj || typeof typObj !== 'object') return typObj;
+  const result: any = {};
+  for (const scaleName of Object.keys(typObj)) result[scaleName] = _jex_addTypographyComposite(typObj[scaleName], scaleName);
+  return result;
+}
+
+function _jex_buildElevationComposite(aliasBase: string): any {
+  return { value: { color: '{' + aliasBase + '.colour}', type: 'dropShadow', x: '{' + aliasBase + '.x}', y: '{' + aliasBase + '.y}', blur: '{' + aliasBase + '.blur}', spread: '{' + aliasBase + '.spread}' }, type: 'boxShadow' };
+}
+
+function _jex_addElevationComposites(elevationObj: any, elevPrefix: string): any {
+  elevPrefix = elevPrefix || 'scheme.elevation';
+  for (const level of ['level-0','level-1','level-2','level-3','level-4','level-5','level-6']) {
+    if (!elevationObj[level]) continue;
+    const composite = _jex_buildElevationComposite(elevPrefix + '.' + level);
+    const rebuilt: any = {};
+    rebuilt[level] = composite;
+    for (const k of Object.keys(elevationObj[level])) if (k !== level) rebuilt[k] = elevationObj[level][k];
+    elevationObj[level] = rebuilt;
+  }
+  for (const entry of ['app-bar-top','app-bar-bottom']) {
+    if (!elevationObj[entry]) continue;
+    for (const variant of ['flat','raised']) {
+      if (!elevationObj[entry][variant]) continue;
+      const composite = _jex_buildElevationComposite(elevPrefix + '.' + entry + '.' + variant);
+      const rebuilt: any = {}; rebuilt[variant] = composite;
+      for (const k of Object.keys(elevationObj[entry][variant])) if (k !== variant) rebuilt[k] = elevationObj[entry][variant][k];
+      elevationObj[entry][variant] = rebuilt;
+    }
+  }
+  if (elevationObj['FAB']) {
+    for (const variant of ['standard','hovered','pressed']) {
+      if (!elevationObj['FAB'][variant]) continue;
+      const composite = _jex_buildElevationComposite(elevPrefix + '.FAB.' + variant);
+      const rebuilt: any = {}; rebuilt[variant] = composite;
+      for (const k of Object.keys(elevationObj['FAB'][variant])) if (k !== variant) rebuilt[k] = elevationObj['FAB'][variant][k];
+      elevationObj['FAB'][variant] = rebuilt;
+    }
+  }
+  return elevationObj;
+}
+
+function _jex_applyElevationIfPresent(obj: any, elevPrefix: string): any {
+  if (!obj || typeof obj !== 'object' || !obj.elevation) return obj;
+  const result: any = {};
+  for (const k of Object.keys(obj)) result[k] = obj[k];
+  result.elevation = _jex_addElevationComposites(result.elevation, elevPrefix);
+  return result;
+}
+
+function _jex_applyDimensionBaseExpressions(core: any): any {
+  if (!core || !core.dimension || !core.dimension.base) return core;
+  const baseTok = core.dimension.base;
+  const baseVal = parseFloat(String(baseTok.value));
+  if (isNaN(baseVal) || baseVal === 0) return core;
+  for (const k of Object.keys(core.dimension)) {
+    if (k === 'base' || k === '0') continue;
+    const tok = core.dimension[k];
+    if (!tok || tok.type !== 'dimension') continue;
+    const num = parseFloat(String(tok.value));
+    if (isNaN(num)) continue;
+    const mult = num / baseVal;
+    const rounded = Math.round(mult);
+    if (Math.abs(mult - rounded) < 1e-6) tok.value = rounded + '*{dimension.base}';
+  }
+  return core;
+}
+
+function _jex_ensureCoreTextCaseAndDecoration(core: any): any {
+  if (!core || typeof core !== 'object') return core;
+  if (!core.textCase) core.textCase = {};
+  if (!core.textCase.none) core.textCase.none = { value: 'none', type: 'textCase' };
+  if (!core.textDecoration) core.textDecoration = {};
+  if (!core.textDecoration.none) core.textDecoration.none = { value: 'none', type: 'textDecoration' };
+  return core;
+}
+
+const _NATO_TS_DEFAULT_LINE_HEIGHTS: Record<string, any> = {
+  '0': { value: '100%', type: 'lineHeights' }, '1': { value: '130%', type: 'lineHeights' },
+  '2': { value: '120%', type: 'lineHeights' }, '3': { value: '125%', type: 'lineHeights' }
+};
+const _NATO_LINE_HEIGHT_KEBAB_TO_SEMANTIC: Record<string, string> = { '100':'0', '130':'1', '120':'2', '125':'3' };
+const _NATO_TS_DEFAULT_LETTER_SPACING: Record<string, any> = {
+  '0': { value: '-5%', type: 'letterSpacing' }, '1': { value: '-4%', type: 'letterSpacing' },
+  '2': { value: '-3%', type: 'letterSpacing' }, '3': { value: '-2.5%', type: 'letterSpacing' },
+  '4': { value: '-2%', type: 'letterSpacing' }, '5': { value: '-0.5%', type: 'letterSpacing' },
+  '6': { value: '-1%', type: 'letterSpacing' }, '7': { value: '0%', type: 'letterSpacing' },
+  '8': { value: '0.5%', type: 'letterSpacing' }
+};
+
+function _jex_coerceToPercent(raw: any): string | null {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (/%$/.test(s)) return s;
+  const n = parseFloat(s.replace(/,/g, '.'));
+  if (isNaN(n)) return s;
+  return n + '%';
+}
+
+function _jex_ensureCoreLineHeightsLetterSpacing(core: any): any {
+  if (!core || typeof core !== 'object') return core;
+  const lhExisting = core.lineHeights;
+  const hasLh0123 = lhExisting && typeof lhExisting === 'object' && lhExisting['0'] && lhExisting['1'] && lhExisting['2'] && lhExisting['3'];
+  if (!hasLh0123) {
+    const kebab = core['line-heights'];
+    const partial: any = {};
+    if (kebab && typeof kebab === 'object') {
+      for (const multKey of Object.keys(kebab)) {
+        const sem = _NATO_LINE_HEIGHT_KEBAB_TO_SEMANTIC[multKey];
+        if (sem === undefined) continue;
+        const tok = kebab[multKey];
+        if (!tok || tok.value === undefined) continue;
+        const pct = _jex_coerceToPercent(tok.value);
+        if (pct) partial[sem] = { value: pct, type: 'lineHeights' };
+      }
+    }
+    const out: any = {};
+    for (const k of ['0','1','2','3']) {
+      if (partial[k] && partial[k].value !== undefined) out[k] = { value: _jex_coerceToPercent(partial[k].value) || partial[k].value, type: 'lineHeights' };
+      else if (lhExisting && lhExisting[k] && lhExisting[k].value !== undefined) out[k] = { value: _jex_coerceToPercent(lhExisting[k].value) || lhExisting[k].value, type: 'lineHeights' };
+      else if (_NATO_TS_DEFAULT_LINE_HEIGHTS[k]) out[k] = { value: _NATO_TS_DEFAULT_LINE_HEIGHTS[k].value, type: 'lineHeights' };
+    }
+    core.lineHeights = out;
+  } else {
+    for (const k of ['0','1','2','3']) {
+      const t = lhExisting[k];
+      if (t && t.value !== undefined && !/%$/.test(String(t.value))) { t.value = _jex_coerceToPercent(t.value); t.type = 'lineHeights'; }
+    }
+  }
+  const lsExisting = core.letterSpacing;
+  const lsKeys = lsExisting && typeof lsExisting === 'object' ? Object.keys(lsExisting) : [];
+  if (lsKeys.length < 9) {
+    const out: any = {};
+    for (const k of Object.keys(_NATO_TS_DEFAULT_LETTER_SPACING)) {
+      if (lsExisting && lsExisting[k] && lsExisting[k].value !== undefined) out[k] = { value: _jex_coerceToPercent(lsExisting[k].value) || String(lsExisting[k].value), type: 'letterSpacing' };
+      else out[k] = { value: _NATO_TS_DEFAULT_LETTER_SPACING[k].value, type: 'letterSpacing' };
+    }
+    core.letterSpacing = out;
+  } else {
+    for (const k of Object.keys(lsExisting)) {
+      const t = lsExisting[k];
+      if (t && t.value !== undefined && !/%$/.test(String(t.value))) { t.value = _jex_coerceToPercent(t.value); t.type = 'letterSpacing'; }
+    }
+  }
+  return core;
+}
+
+function _jex_generateHashFromId(id: string): string {
+  const str = String(id);
+  const chars = '0123456789abcdef';
+  let seed = 0;
+  for (let i = 0; i < str.length; i++) seed = (Math.imul(31, seed) + str.charCodeAt(i)) | 0;
+  if (seed === 0) seed = 1;
+  seed = Math.abs(seed);
+  function mulberry32(a: number) {
+    return function() {
+      let t = a += 0x6D2B79F5;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rand = mulberry32(seed);
+  let hash = '';
+  for (let j = 0; j < 40; j++) hash += chars[Math.floor(rand() * 16)];
+  return hash;
+}
+
+function _jex_stripVariableIdPrefix(id: string): string {
+  let cleanId = id;
+  if (id.indexOf('/') !== -1) cleanId = id.split('/')[1] || id;
+  return _jex_generateHashFromId(cleanId);
+}
+
+function _jex_generateThemeId(): string {
+  const chars = '0123456789abcdef';
+  let id = '';
+  for (let i = 0; i < 40; i++) id += chars[Math.floor(Math.random() * 16)];
+  return id;
+}
+
+function _jex_getCollectionByNameLoose(map: Record<string, any>, primary: string): any {
+  if (map[primary]) return map[primary];
+  const lower = primary.toLowerCase();
+  for (const k of Object.keys(map)) if (k.toLowerCase() === lower) return map[k];
+  return undefined;
+}
+
+const _JEX_TOKEN_STUDIO_SET_ORDER = [
+  'core','foundation','mode/light','mode/dark','scheme/neutral','scheme/inverted','scheme/white',
+  'scheme/black','scheme/brand','scheme/secondary','secondary/amber','secondary/aqua','secondary/ice',
+  'secondary/dandelion','secondary/egg','secondary/frog','secondary/guacamole','secondary/hummingbird',
+  'secondary/iguana','secondary/jacuzzi','secondary/kingfisher','secondary/lagoon','secondary/macaw',
+  'secondary/nebula','secondary/orchid','white','black','brand','restrictions/unrestricted',
+  'restrictions/to-neutral','restrictions/to-neutral-and-brand','restrictions/to-neutral-and-secondary',
+  'breakpoint/mobile','breakpoint/tablet','breakpoint/laptop','breakpoint/desktop','breakpoint/large-desktop','layout/layout'
+];
+
+function _jex_buildTokenSetOrder(out: any): string[] {
+  const order: string[] = [];
+  for (const k of _JEX_TOKEN_STUDIO_SET_ORDER) if (out[k] !== undefined) order.push(k);
+  for (const k of Object.keys(out)) if (k.charAt(0) !== '$' && order.indexOf(k) === -1) order.push(k);
+  return order;
+}
+
+function _jex_buildThemes(rawData: any, tokenSetNames: string[]): any[] {
+  if (!rawData || !Array.isArray(rawData.collections)) return [];
+  const collectionMap: Record<string, any> = {};
+  rawData.collections.forEach((col: any) => { collectionMap[col.name] = col; });
+
+  function generateHashFromId(id: string) { return _jex_generateHashFromId(id); }
+  function formatStyleId(id: string) { const cleanId = String(id).replace(/^S:/, ''); return 'S:' + generateHashFromId(cleanId) + ','; }
+  function toTokenStudioCase(name: string) {
+    const parts = name.replace(/\s+/g, '-').split('-');
+    return parts.map((p: string) => (p.length === 1 && /[A-Z]/.test(p)) ? p : p.toLowerCase()).join('-');
+  }
+
+  function buildStyleRefsForTheme(themeName: string, themeGroup: string | null): Record<string, string> {
+    const refs: Record<string, string> = {};
+    if (!rawData.styles) return refs;
+    if (themeGroup === 'layout') return {};
+    if (themeName === 'foundation' && (!themeGroup || themeGroup === '')) {
+      // Foundation style refs
+      const shortLevel: any[] = [], typoEntries: any[] = [], longLevel: any[] = [], appBarFab: any[] = [], fallback: any[] = [];
+      if (rawData.styles.effectStyles) {
+        rawData.styles.effectStyles.forEach((style: any) => {
+          const lowerParts = style.name.split('/').map((p: string) => toTokenStudioCase(p));
+          const basePath = lowerParts.join('.');
+          const lastSeg = lowerParts[lowerParts.length - 1];
+          const id = formatStyleId(style.id);
+          const lm = basePath.match(/^elevation\.level-(\d+)$/i);
+          if (lm) { const n = parseInt(lm[1]); longLevel.push({ n, key: 'elevation.level-'+n+'.level-'+n, id }); if (n >= 1) shortLevel.push({ n, key: 'elevation.level-'+n, id }); return; }
+          if (basePath.indexOf('elevation.') === 0 && lowerParts.length >= 2) { appBarFab.push({ key: basePath + '.' + lastSeg, id }); return; }
+          fallback.push({ key: basePath, id });
+        });
+      }
+      if (rawData.styles.textStyles) {
+        rawData.styles.textStyles.forEach((style: any) => {
+          const nameParts = style.name.split('/');
+          const id = formatStyleId(style.id);
+          let tokenPath: string;
+          if (nameParts.length >= 2) { const lp = nameParts.map((p: string) => toTokenStudioCase(p)); tokenPath = lp.join('.') + '.' + lp[lp.length - 1]; }
+          else { const converted = toTokenStudioCase(style.name); tokenPath = 'typography.' + converted + '.' + converted; }
+          typoEntries.push({ key: tokenPath, id });
+        });
+      }
+      shortLevel.sort((a: any, b: any) => a.n - b.n);
+      longLevel.sort((a: any, b: any) => a.n - b.n);
+      shortLevel.forEach((e: any) => { refs[e.key] = e.id; });
+      typoEntries.forEach((e: any) => { refs[e.key] = e.id; });
+      longLevel.forEach((e: any) => { refs[e.key] = e.id; });
+      appBarFab.forEach((e: any) => { refs[e.key] = e.id; });
+      fallback.forEach((e: any) => { refs[e.key] = e.id; });
+      return refs;
+    }
+    if (themeGroup === '.breakpoint') {
+      if (rawData.styles.textStyles) {
+        rawData.styles.textStyles.forEach((style: any) => {
+          const nameParts = style.name.split('/');
+          let tokenPath: string;
+          if (nameParts.length >= 2) { const lp = nameParts.map((p: string) => toTokenStudioCase(p)); tokenPath = 'breakpoint.' + lp.join('.') + '.' + lp[lp.length - 1]; }
+          else { const converted = toTokenStudioCase(style.name); tokenPath = 'breakpoint.typography.' + converted + '.' + converted; }
+          refs[tokenPath] = formatStyleId(style.id);
+        });
+      }
+      return refs;
+    }
+    // Other themes: effect styles + text styles
+    if (rawData.styles.effectStyles) {
+      rawData.styles.effectStyles.forEach((style: any) => {
+        const nameParts = style.name.split('/');
+        let tokenPath: string;
+        if (nameParts.length >= 2) { const lp = nameParts.map((p: string) => toTokenStudioCase(p)); tokenPath = lp.join('.') + '.' + lp[lp.length - 1]; }
+        else tokenPath = style.name.replace(/\//g, '.');
+        refs[tokenPath] = formatStyleId(style.id);
+      });
+    }
+    if (rawData.styles.textStyles) {
+      rawData.styles.textStyles.forEach((style: any) => {
+        const nameParts = style.name.split('/');
+        let tokenPath: string;
+        if (nameParts.length >= 2) { const lp = nameParts.map((p: string) => toTokenStudioCase(p)); tokenPath = lp.join('.') + '.' + lp[lp.length - 1]; }
+        else { const converted = toTokenStudioCase(style.name); tokenPath = 'typography.' + converted + '.' + converted; }
+        refs[tokenPath] = formatStyleId(style.id);
+      });
+    }
+    return refs;
+  }
+
+  const themeConfigs: any[] = [];
+
+  if (tokenSetNames.indexOf('foundation') !== -1) {
+    const foundationCol = collectionMap['foundation'];
+    if (foundationCol && foundationCol.modes.length > 0) {
+      themeConfigs.push({ name: 'foundation', group: null, selectedTokenSets: { 'foundation': 'enabled', 'core': 'source' }, collection: foundationCol, modeIndex: 0 });
+    }
+  }
+
+  if (tokenSetNames.indexOf('core') !== -1) {
+    const coreCol = collectionMap['.core'] || collectionMap['core'];
+    if (coreCol && coreCol.modes.length > 0) {
+      themeConfigs.push({ name: '.core', group: null, selectedTokenSets: { 'core': 'enabled' }, collection: coreCol, modeIndex: 0 });
+    }
+  }
+
+  for (const name of ['white','black','brand']) {
+    if (tokenSetNames.indexOf(name) !== -1) {
+      const col = collectionMap['.' + name] || collectionMap[name];
+      if (col && col.modes.length > 0) {
+        const ss: any = { 'core': 'source' }; ss[name] = 'enabled';
+        themeConfigs.push({ name: '.' + name, group: null, selectedTokenSets: ss, collection: col, modeIndex: 0 });
+      }
+    }
+  }
+
+  const modeCol = collectionMap['.mode'];
+  if (modeCol) {
+    modeCol.modes.forEach((mode: any, idx: number) => {
+      const modeName = mode.name.toLowerCase();
+      const tokenSetKey = 'mode/' + modeName;
+      if (tokenSetNames.indexOf(tokenSetKey) !== -1) {
+        const ss: any = {}; ss[tokenSetKey] = 'enabled';
+        if (tokenSetNames.indexOf('restrictions/unrestricted') !== -1) ss['restrictions/unrestricted'] = 'source';
+        themeConfigs.push({ name: modeName, group: '.mode', selectedTokenSets: ss, collection: modeCol, modeIndex: idx });
+      }
+    });
+  }
+
+  const schemeNames = ['neutral','inverted','white','black','brand','secondary'];
+  schemeNames.forEach(schemeName => {
+    const tokenSetKey = 'scheme/' + schemeName;
+    if (tokenSetNames.indexOf(tokenSetKey) === -1) return;
+    let schemeCol: any = null, schemeModeIdx = -1;
+    Object.keys(collectionMap).forEach(colName => {
+      const col = collectionMap[colName];
+      col.modes.forEach((mode: any, idx: number) => {
+        const ml = mode.name.toLowerCase();
+        if (ml === schemeName || ml.indexOf(schemeName) !== -1) { schemeCol = col; schemeModeIdx = idx; }
+      });
+    });
+    if (schemeCol && schemeModeIdx >= 0) {
+      const ss: any = {}; ss[tokenSetKey] = 'enabled';
+      themeConfigs.push({ name: schemeName, group: '.scheme', selectedTokenSets: ss, collection: schemeCol, modeIndex: schemeModeIdx });
+    }
+  });
+
+  const secondaryCol = collectionMap['.secondary'];
+  if (secondaryCol) {
+    secondaryCol.modes.forEach((mode: any, idx: number) => {
+      const modeName = mode.name.toLowerCase();
+      if (schemeNames.indexOf(modeName) !== -1) return;
+      const tokenSetKey = 'secondary/' + modeName;
+      if (tokenSetNames.indexOf(tokenSetKey) !== -1) {
+        const ss: any = {}; ss[tokenSetKey] = 'enabled';
+        themeConfigs.push({ name: modeName, group: '.secondary', selectedTokenSets: ss, collection: secondaryCol, modeIndex: idx });
+      }
+    });
+  }
+
+  const restrictedCol = collectionMap['_restricted'];
+  if (restrictedCol) {
+    restrictedCol.modes.forEach((mode: any, idx: number) => {
+      const modeName = mode.name.toLowerCase().replace(/\s+/g, '-');
+      const tokenSetKey = 'restrictions/' + modeName;
+      if (tokenSetNames.indexOf(tokenSetKey) !== -1) {
+        const ss: any = {}; ss[tokenSetKey] = 'enabled';
+        themeConfigs.push({ name: modeName, group: '.restrictions', selectedTokenSets: ss, collection: restrictedCol, modeIndex: idx });
+      }
+    });
+  }
+
+  const breakpointCol = collectionMap['.breakpoint'];
+  const bpMap: Record<string, string> = { 's-mobile':'mobile','m-tablet':'tablet','l-laptop':'laptop','xl-desktop':'desktop','xxl-large-desktop':'large-desktop' };
+  if (breakpointCol) {
+    breakpointCol.modes.forEach((mode: any, idx: number) => {
+      const modeLower = mode.name.toLowerCase().replace(/\s+/g, '-');
+      const tokenSetSlug = bpMap[modeLower] || modeLower.split('-').slice(1).join('-') || modeLower;
+      const tokenSetKey = 'breakpoint/' + tokenSetSlug;
+      if (tokenSetNames.indexOf(tokenSetKey) !== -1) {
+        const ss: any = {}; ss[tokenSetKey] = 'enabled'; ss['core'] = 'source';
+        themeConfigs.push({ name: mode.name, group: '.breakpoint', selectedTokenSets: ss, collection: breakpointCol, modeIndex: idx });
+      }
+    });
+  }
+
+  const layoutCol = _jex_getCollectionByNameLoose(collectionMap, 'layout');
+  if (layoutCol) {
+    layoutCol.modes.forEach((mode: any, idx: number) => {
+      const tokenSetKey = 'layout/layout';
+      if (tokenSetNames.indexOf(tokenSetKey) !== -1) {
+        const ss: any = {}; ss[tokenSetKey] = 'enabled';
+        themeConfigs.push({ name: mode.name.toLowerCase(), group: 'layout', selectedTokenSets: ss, collection: layoutCol, modeIndex: idx });
+      }
+    });
+  }
+
+  const themes: any[] = [];
+  themeConfigs.forEach(config => {
+    const theme: any = { id: _jex_generateThemeId(), name: config.name };
+    if (config.group) theme.group = config.group;
+    theme.selectedTokenSets = config.selectedTokenSets;
+    const styleRefs = buildStyleRefsForTheme(config.name, config.group);
+    if (config.group === 'layout') theme['$figmaStyleReferences'] = {};
+    else if (Object.keys(styleRefs).length > 0) theme['$figmaStyleReferences'] = styleRefs;
+    const figmaVarRefs: Record<string, string> = {};
+    if (config.collection && config.collection.variables) {
+      const varPrefixMap: Record<string, string> = { '.mode':'mode.', '.scheme':'scheme.', '.breakpoint':'breakpoint.', '.secondary':'secondary.', '.restrictions':'restrictions.' };
+      let varPrefix = varPrefixMap[config.group] || '';
+      if (config.name === '.white') varPrefix = 'white.';
+      else if (config.name === '.black') varPrefix = 'black.';
+      else if (config.name === '.brand') varPrefix = 'brand.';
+      config.collection.variables.forEach((v: any) => {
+        if (v.name && v.id) {
+          const varName = v.name.replace(/\//g, '.');
+          if (varPrefix && varName.toLowerCase().startsWith(varPrefix.slice(0, -1).toLowerCase() + '.')) figmaVarRefs[varName] = _jex_stripVariableIdPrefix(v.id);
+          else figmaVarRefs[varPrefix + varName] = _jex_stripVariableIdPrefix(v.id);
+        }
+      });
+    }
+    if (Object.keys(figmaVarRefs).length > 0) theme['$figmaVariableReferences'] = figmaVarRefs;
+    if (config.collection) {
+      theme['$figmaCollectionId'] = config.collection.id;
+      if (config.collection.modes[config.modeIndex]) theme['$figmaModeId'] = config.collection.modes[config.modeIndex].modeId;
+    }
+    themes.push(theme);
+  });
+  return themes;
+}
+
+function _jex_toTokenStudioFormat(native: any, rawData: any): any {
+  let out: any = {};
+  const BP_KEY_ORDER = ['spacing','sizing','typography','grid','stretch-grid','overflow-grid','fixed-grid','columns','layout','breakpoint-string'];
+  const FOUNDATION_KEY_ORDER = ['spacing','sizing','radius','colours','typography','strokes','grid','elevation','variant'];
+  const bpMap: Record<string, string> = { 'S Mobile':'mobile','M Tablet':'tablet','L Laptop':'laptop','XL Desktop':'desktop','XXL Large Desktop':'large-desktop' };
+  const modeElevPrefixMap: Record<string, any> = { 'light': { main:'white.elevation', inverted:'black.elevation' }, 'dark': { main:'black.elevation', inverted:'white.elevation' } };
+  const schemeElevPrefixMap: Record<string, string> = { 'neutral':'mode.elevation','inverted':'mode-inverted.elevation','white':'white.elevation','black':'black.elevation','brand':'brand.elevation','secondary':'secondary.elevation' };
+
+  // core
+  if (native['.core'] && native['.core']['.core']) {
+    out['core'] = _jex_fixCoreTokens(native['.core']['.core']);
+    _jex_applyDimensionBaseExpressions(out['core']);
+  }
+  if (!out['core']) out['core'] = {};
+  _jex_ensureCoreTextCaseAndDecoration(out['core']);
+  _jex_ensureCoreLineHeightsLetterSpacing(out['core']);
+
+  // foundation
+  if (native['foundation'] && native['foundation']['foundation']) out['foundation'] = native['foundation']['foundation'];
+  if (out['foundation']) out['foundation'] = _jex_fixFoundationTokens(out['foundation']);
+  else out['foundation'] = {};
+  if (out['foundation']['elevation']) out['foundation']['elevation'] = _jex_addElevationComposites(out['foundation']['elevation'], 'scheme.elevation');
+  if (!out['foundation']['variant']) out['foundation']['variant'] = {};
+  out['foundation']['variant']['breakpoint'] = { value: '{breakpoint.breakpoint-string}', type: 'text' };
+
+  // foundation typography aliases
+  const typScales = ['display','title-L','title-M','title-S','subtitle','paragraph','body-L','body-M-bold','body-M-regular','link-M-bold','link-M-regular','body-S-bold','body-S-regular','link-S-regular','microcopy-bold','microcopy-regular'];
+  const typProps = [
+    { name: null, type: 'typography' }, { name: 'size', type: 'number' }, { name: 'line-height', type: 'number' },
+    { name: 'weight', type: 'number' }, { name: 'letter-spacing', type: 'number' }, { name: 'font-family', type: 'text' },
+    { name: 'paragraph-spacing', type: 'number' }, { name: 'paragraph-indent', type: 'number' },
+    { name: 'text-case', type: 'textCase' }, { name: 'text-decoration', type: 'textDecoration' }
+  ];
+  const foundTypography: any = {};
+  typScales.forEach(scale => {
+    foundTypography[scale] = {};
+    typProps.forEach(prop => {
+      const propKey = prop.name !== null ? prop.name : scale;
+      foundTypography[scale][propKey] = { value: '{breakpoint.typography.' + scale + '.' + propKey + '}', type: prop.type };
+    });
+  });
+  out['foundation']['typography'] = foundTypography;
+  const orderedFoundation: any = {};
+  FOUNDATION_KEY_ORDER.forEach(k => { if (out['foundation'][k] !== undefined) orderedFoundation[k] = out['foundation'][k]; });
+  Object.keys(out['foundation']).forEach(k => { if (orderedFoundation[k] === undefined) orderedFoundation[k] = out['foundation'][k]; });
+  out['foundation'] = orderedFoundation;
+
+  // mode
+  if (native['.mode']) {
+    Object.keys(native['.mode']).forEach(name => {
+      const content = native['.mode'][name];
+      const modeInverted = content['mode-inverted'];
+      const rest: any = {};
+      Object.keys(content).forEach(k => { if (k !== 'mode-inverted') rest[k] = content[k]; });
+      const elevPrefixes = modeElevPrefixMap[name] || { main:'mode.elevation', inverted:'mode-inverted.elevation' };
+      const setContent: any = { mode: _jex_applyElevationIfPresent(rest, elevPrefixes.main) };
+      if (modeInverted) setContent['mode-inverted'] = _jex_applyElevationIfPresent(modeInverted, elevPrefixes.inverted);
+      out['mode/' + name] = setContent;
+    });
+  }
+
+  // scheme
+  if (native['.scheme']) {
+    Object.keys(native['.scheme']).forEach(name => {
+      const elevPrefix = schemeElevPrefixMap[name] || (name + '.elevation');
+      out['scheme/' + name] = { scheme: _jex_applyElevationIfPresent(native['.scheme'][name], elevPrefix) };
+    });
+  }
+
+  // secondary
+  if (native['.secondary']) {
+    Object.keys(native['.secondary']).forEach(name => {
+      out['secondary/' + name] = { secondary: _jex_applyElevationIfPresent(native['.secondary'][name], 'secondary.elevation') };
+    });
+  }
+
+  // white, black, brand
+  for (const key of ['.white','.black','.brand']) {
+    if (native[key]) {
+      const clean = key.slice(1);
+      const inner = native[key][key] !== undefined ? native[key][key] : native[key][clean];
+      if (inner !== undefined) { out[clean] = {}; out[clean][clean] = _jex_applyElevationIfPresent(inner, clean + '.elevation'); }
+      else out[clean] = native[key];
+    }
+  }
+
+  // restrictions
+  if (native['_restricted']) {
+    Object.keys(native['_restricted']).forEach(name => { out['restrictions/' + name] = native['_restricted'][name]; });
+  }
+
+  // breakpoints
+  if (native['.breakpoint']) {
+    const collectionLevelTypography = native['.breakpoint'].typography;
+    Object.keys(native['.breakpoint']).forEach(name => {
+      if (!bpMap[name]) return;
+      const slug = bpMap[name];
+      let content = _jex_fixBreakpointTypes(native['.breakpoint'][name], []);
+      if (!content.typography && collectionLevelTypography) {
+        const typProcessed = _jex_fixBreakpointTypes(collectionLevelTypography, ['typography']);
+        const merged: any = {};
+        Object.keys(content).forEach(k => { merged[k] = content[k]; });
+        merged.typography = typProcessed;
+        content = merged;
+      }
+      if (content.typography) {
+        const withTypo: any = {};
+        Object.keys(content).forEach(k => { withTypo[k] = content[k]; });
+        withTypo.typography = _jex_fixBreakpointTypography(content.typography);
+        content = withTypo;
+      }
+      const orderedContent: any = {};
+      BP_KEY_ORDER.forEach(k => { if (content[k] !== undefined) orderedContent[k] = content[k]; });
+      Object.keys(content).forEach(k => { if (orderedContent[k] === undefined) orderedContent[k] = content[k]; });
+      out['breakpoint/' + slug] = { breakpoint: orderedContent };
+    });
+  }
+
+  // layout
+  const layoutRoot = native['layout'] || native['Layout'];
+  if (layoutRoot && layoutRoot['columns']) {
+    const layoutMode = layoutRoot['columns'];
+    const layoutContent = layoutMode['columns'] || layoutMode;
+    const fixedContent: any = {};
+    const walkLayout = (obj: any): any => {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+      if (Object.prototype.hasOwnProperty.call(obj, 'value') && Object.prototype.hasOwnProperty.call(obj, 'type')) return { value: obj.value, type: 'sizing' };
+      const r: any = {}; for (const k of Object.keys(obj)) r[k] = walkLayout(obj[k]); return r;
+    };
+    out['layout/layout'] = { columns: walkLayout(layoutContent) };
+  }
+
+  // $themes
+  const tokenSetNames = Object.keys(out).filter(k => k !== '$themes');
+  out['$themes'] = _jex_buildThemes(rawData, tokenSetNames);
+
+  // finalize
+  out = _jex_fixKeyOrder(out);
+  out = _jex_fixAliasPaths(out);
+  out['$metadata'] = { tokenSetOrder: _jex_buildTokenSetOrder(out) };
+  return out;
+}
+
+// ============================================================================
 // DESKTOP BRIDGE — Helper functions & init
 // ============================================================================
 
@@ -556,6 +1458,25 @@ function _dbHexToRGB(hex: string): { r: number; g: number; b: number; a: number 
     figma.ui.postMessage({ type: 'ERROR', error: e instanceof Error ? e.message : String(e) });
   }
 })();
+
+// ============================================================================
+// DS settings persistence (logo PNG is stored separately — large data URLs do not fit one postMessage with the rest of the config)
+// ============================================================================
+
+const DS_SETTINGS_STORAGE_KEY = 'dscc-ds-settings';
+const DS_LOGO_PNG_STORAGE_KEY = 'dscc-ds-settings-logo-png';
+
+let _dsSettingsSaveChain: Promise<void> = Promise.resolve();
+
+function enqueueDsSettingsSaveStep(step: () => Promise<void>): void {
+  _dsSettingsSaveChain = _dsSettingsSaveChain
+    .then(step)
+    .catch((e: unknown) => {
+      const err = e instanceof Error ? e.message : String(e);
+      figma.ui.postMessage({ type: 'DS_SETTINGS_SAVED', error: err });
+    })
+    .then(() => undefined);
+}
 
 // ============================================================================
 // Message Handler
@@ -1048,6 +1969,53 @@ figma.ui.onmessage = async (msg) => {
             collectionName: coll ? coll.name : undefined,
             valuePreview
           };
+
+          // ── Foundation: inject formula rules + alias/value metadata ──────
+          if (coll?.name === 'foundation') {
+            const allVars = await figma.variables.getLocalVariablesAsync();
+            const varMap: Record<string, typeof variable> = {};
+            for (const v of allVars) varMap[v.id] = v;
+
+            // Resolve alias target (one hop)
+            const modeId = Object.keys(variable.valuesByMode)[0];
+            const modeVal = (variable.valuesByMode as any)[modeId];
+            let aliasTarget: string | null = null;
+            let leafValue: number | null = null;
+            if (modeVal && typeof modeVal === 'object' && modeVal.type === 'VARIABLE_ALIAS') {
+              const target = varMap[modeVal.id];
+              aliasTarget = target?.name ?? modeVal.id;
+              // follow to leaf
+              let cur: any = target;
+              for (let d = 0; d < 10 && cur; d++) {
+                const mid = Object.keys(cur.valuesByMode)[0];
+                const val = (cur.valuesByMode as any)[mid];
+                if (val && typeof val === 'object' && val.type === 'VARIABLE_ALIAS') {
+                  cur = varMap[val.id];
+                } else {
+                  if (typeof val === 'number') leafValue = val;
+                  break;
+                }
+              }
+            } else if (typeof modeVal === 'number') {
+              leafValue = modeVal;
+            }
+
+            const group = variable.name.split('/')[0];
+            const conformanceErrors: string[] = (issue as any).foundationConformanceErrors ?? [];
+
+            issueContext = {
+              ...issueContext,
+              isFoundation: true,
+              group,
+              aliasTarget,
+              resolvedValuePx:
+                leafValue !== null
+                  ? formatTypographicFloatDisplay(variable.name, Math.round(leafValue * 100) / 100)
+                  : null,
+              scopes: (variable as any).scopes ?? [],
+              conformanceErrors,
+            };
+          }
         }
       } else if (issue.nodeType === 'PAINT' || issue.nodeType === 'TEXT' || issue.nodeType === 'EFFECT') {
         const style = await figma.getStyleByIdAsync(issue.nodeId);
@@ -1073,9 +2041,37 @@ figma.ui.onmessage = async (msg) => {
         }
       }
 
+      // For foundation variables, override rules with the 4-slot formula spec so
+      // the AI generates a structurally correct description rather than a paraphrase.
+      const isFoundation = (issueContext as any).isFoundation === true;
+      const rulesPayload = isFoundation
+        ? `FOUNDATION VARIABLE DESCRIPTION FORMULA — follow exactly, no paraphrasing.
+
+Output up to 4 sentences in this fixed order. Each sentence is mandatory or conditional as stated.
+
+S1 (ALWAYS): Semantic role — state what the token *is*, never repeat its name or the word "foundation".
+S2 (conditional): Resolved value with unit. e.g. "24px base." — omit for colours and typography.
+S3 (if aliased): MUST start with "Aliases " then the exact alias path, then the tag in brackets.
+  - responsive tokens → "(responsive)"  e.g. "Aliases breakpoint/spacing/component/7 (responsive)."
+  - mode-adaptive tokens → "(light/dark adaptive)"  e.g. "Aliases Mode/colours/basic/background (light/dark adaptive)."
+S4 (ALWAYS): 2–4 specific UI element names. e.g. "Use for internal component gaps: icon-to-label, input padding, list-item rows."
+
+Group rules:
+- spacing: S1 = "[Zero|Smallest|Extra-small|Small|Medium|Standard|Large|Extra-large|Largest] [component|layout] spacing step." S3 tag = (responsive)
+- sizing: S3 tag = (responsive). S4 names specific control types.
+- radius: S1 includes the resolved px inline. S3 tag = none (raw) or exact alias name.
+- colours: omit S2 entirely. S3 tag = (light/dark adaptive). Add pairing sentence for basic/background* and basic/text* only.
+- typography: S1 = "[Property label] for [scale-level] text style." Omit S2. S3 tag = (responsive).
+- elevation: S1 = "[shadow component] for [metaphor] elevation ([level] level)." Omit S2 for colour property. S3 tag = (light/dark adaptive).
+- strokes: S1 = "[n]px border width." S3 = "Aliases X." or "Raw value."
+- grid: append final sentence "Not directly bindable in Figma — reference value for layout code and grid plugins only."
+
+Output ONLY the description. No quotes, no preamble.`
+        : rulesSummary;
+
       figma.ui.postMessage({
         type: 'RULES_AND_CONTEXT',
-        rules: rulesSummary,
+        rules: rulesPayload,
         issueContext
       });
     } catch (e) {
@@ -1588,12 +2584,42 @@ figma.ui.onmessage = async (msg) => {
       const variable = await figma.variables.getVariableByIdAsync(m.variableId);
       if (!variable) throw new Error('Variable not found: ' + m.variableId);
       let value = m.value;
-      if (typeof value === 'string' && value.startsWith('VariableID:')) {
+      const isAliasObj =
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        (value as { type?: string }).type === 'VARIABLE_ALIAS' &&
+        typeof (value as { id?: string }).id === 'string';
+      if (isAliasObj) {
+        /* structured-clone object from UI — use as-is */
+      } else if (typeof value === 'string' && value.startsWith('VariableID:')) {
         value = { type: 'VARIABLE_ALIAS', id: value };
       } else if (variable.resolvedType === 'COLOR' && typeof value === 'string') {
         value = _dbHexToRGB(value);
       }
-      variable.setValueForMode(m.modeId, value);
+      const coll = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
+      const useAllModes = m.allModes === true || (coll && coll.name === '.breakpoint');
+      const modeIds =
+        coll && useAllModes ? coll.modes.map(mod => mod.modeId) : [m.modeId as string];
+
+      // ── Snapshot current values BEFORE overwriting (wizard undo) ──
+      // We snapshot ALL modes that will be modified so undo restores them all.
+      const snapEntries: Array<{ id: string; modeId: string; value: RGBA | VariableAlias | undefined }> = [];
+      for (const modeId of modeIds) {
+        snapEntries.push({
+          id: variable.id,
+          modeId,
+          value: variable.valuesByMode[modeId] as RGBA | VariableAlias | undefined,
+        });
+      }
+      _wizSnapshots.push({ label: `var/${variable.name}`, vars: snapEntries });
+      if (_wizSnapshots.length > 5) _wizSnapshots.shift();
+      console.log('[wizard-undo] snapshot pushed (UPDATE_VARIABLE):', variable.name, 'modes=' + modeIds.length, 'stack=' + _wizSnapshots.length);
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_COUNT', count: _wizSnapshots.length });
+
+      for (const modeId of modeIds) {
+        variable.setValueForMode(modeId, value);
+      }
       figma.ui.postMessage({ type: 'UPDATE_VARIABLE_RESULT', requestId: m.requestId, success: true, variable: _dbSerializeVariable(variable) });
     } catch (e: unknown) {
       figma.ui.postMessage({ type: 'UPDATE_VARIABLE_RESULT', requestId: m.requestId, success: false, error: e instanceof Error ? e.message : String(e) });
@@ -1611,6 +2637,23 @@ figma.ui.onmessage = async (msg) => {
           let v = m.valuesByMode[modeId];
           if (m.resolvedType === 'COLOR' && typeof v === 'string') v = _dbHexToRGB(v);
           variable.setValueForMode(modeId, v);
+        }
+        if (collection.name === '.breakpoint') {
+          const keys = Object.keys(m.valuesByMode);
+          if (keys.length > 0) {
+            const seedKey = keys[0];
+            let seedVal: unknown = m.valuesByMode[seedKey];
+            if (typeof seedVal === 'string' && seedVal.startsWith('VariableID:')) {
+              seedVal = { type: 'VARIABLE_ALIAS', id: seedVal };
+            } else if (m.resolvedType === 'COLOR' && typeof seedVal === 'string') {
+              seedVal = _dbHexToRGB(seedVal);
+            }
+            for (const mod of collection.modes) {
+              if (!Object.prototype.hasOwnProperty.call(m.valuesByMode, mod.modeId)) {
+                variable.setValueForMode(mod.modeId, seedVal as VariableValue);
+              }
+            }
+          }
         }
       }
       if (m.description) variable.description = m.description;
@@ -2099,6 +3142,22 @@ figma.ui.onmessage = async (msg) => {
     }
   }
 
+  else if (msg.type === 'LOAD_UI_THEME') {
+    const UI_THEME_KEY = 'dscc-ui-theme';
+    figma.clientStorage.getAsync(UI_THEME_KEY).then((stored: unknown) => {
+      const theme = stored === 'light' || stored === 'dark' ? stored : 'dark';
+      figma.ui.postMessage({ type: 'UI_THEME_LOADED', theme });
+    }).catch(() => {
+      figma.ui.postMessage({ type: 'UI_THEME_LOADED', theme: 'dark' });
+    });
+  }
+
+  else if (msg.type === 'SAVE_UI_THEME') {
+    const UI_THEME_KEY = 'dscc-ui-theme';
+    const theme = (msg as any).theme === 'light' ? 'light' : 'dark';
+    figma.clientStorage.setAsync(UI_THEME_KEY, theme).catch(() => {});
+  }
+
   else if (msg.type === 'RELOAD_UI') {
     const m = msg as any;
     figma.ui.postMessage({ type: 'RELOAD_UI_RESULT', requestId: m.requestId, success: true });
@@ -2167,6 +3226,47 @@ figma.ui.onmessage = async (msg) => {
     }).catch(() => {});
   }
 
+  else if (msg.type === 'LOAD_DS_SETTINGS') {
+    Promise.all([
+      figma.clientStorage.getAsync(DS_SETTINGS_STORAGE_KEY),
+      figma.clientStorage.getAsync(DS_LOGO_PNG_STORAGE_KEY),
+    ])
+      .then(([stored, logoPng]) => {
+        const config: Record<string, unknown> =
+          stored && typeof stored === 'object' ? { ...(stored as object) } : {};
+        const legacyInline = (config as { logoPngDataUrl?: string }).logoPngDataUrl;
+        delete (config as { logoPngDataUrl?: unknown }).logoPngDataUrl;
+        if (typeof logoPng === 'string' && logoPng.indexOf('data:image/png') === 0) {
+          (config as { logoPngDataUrl?: string }).logoPngDataUrl = logoPng;
+        } else if (typeof legacyInline === 'string' && legacyInline.indexOf('data:image/png') === 0) {
+          (config as { logoPngDataUrl?: string }).logoPngDataUrl = legacyInline;
+        }
+        figma.ui.postMessage({ type: 'DS_SETTINGS_LOADED', config, fileName: figma.root.name || '' });
+      })
+      .catch(() => {
+        figma.ui.postMessage({ type: 'DS_SETTINGS_LOADED', config: {}, fileName: figma.root.name || '' });
+      });
+  }
+
+  else if (msg.type === 'SAVE_DS_SETTINGS') {
+    const raw = (msg as any).config || {};
+    const config = { ...raw };
+    delete (config as { logoPngDataUrl?: unknown }).logoPngDataUrl;
+    enqueueDsSettingsSaveStep(() => figma.clientStorage.setAsync(DS_SETTINGS_STORAGE_KEY, config));
+  }
+
+  else if (msg.type === 'SAVE_DS_LOGO_PNG') {
+    const dataUrl = (msg as any).dataUrl;
+    enqueueDsSettingsSaveStep(async () => {
+      if (typeof dataUrl === 'string' && dataUrl.indexOf('data:image/png') === 0) {
+        await figma.clientStorage.setAsync(DS_LOGO_PNG_STORAGE_KEY, dataUrl);
+      } else {
+        await figma.clientStorage.deleteAsync(DS_LOGO_PNG_STORAGE_KEY);
+      }
+      figma.ui.postMessage({ type: 'DS_SETTINGS_SAVED' });
+    });
+  }
+
   else if (msg.type === 'JSON_EXPORT_LOAD_GIT_SETTINGS') {
     const GIT_CONFIG_KEY = 'json-exporter-git-config';
     figma.clientStorage.getAsync(GIT_CONFIG_KEY).then((stored: any) => {
@@ -2196,91 +3296,19 @@ figma.ui.onmessage = async (msg) => {
   else if (msg.type === 'JSON_EXPORT_EXTRACT') {
     (async () => {
       try {
-        const collections = await figma.variables.getLocalVariableCollectionsAsync();
-
-        const variableIdToCollection = new Map<string, string>();
-        collections.forEach(col => {
-          col.variableIds.forEach(vid => variableIdToCollection.set(vid, _jex_stripIcons(col.name)));
-        });
-
-        const sampleVarId = collections[0]?.variableIds[0];
-        let hasAsyncMethod = false;
-        if (sampleVarId) {
-          const v = await figma.variables.getVariableByIdAsync(sampleVarId);
-          hasAsyncMethod = !!(v && typeof (v as any).valuesByModeForCollectionAsync === 'function');
-        }
-
-        const colResults = await Promise.all(collections.map(async col => {
-          const isExtended = !!(col as any).isExtension || !!(col as any).parentVariableCollectionId || !!(col as any).rootVariableCollectionId;
-          const varPairs: { variable: Variable; collectionValues: Record<string, any> }[] = [];
-
-          await Promise.all(col.variableIds.map(async vid => {
-            const variable = await figma.variables.getVariableByIdAsync(vid);
-            if (!variable) return;
-            let collectionValues: Record<string, any>;
-            if (isExtended && hasAsyncMethod) {
-              collectionValues = await (variable as any).valuesByModeForCollectionAsync(col);
-            } else if (isExtended && (col as any).variableOverrides) {
-              const overridesForVar = (col as any).variableOverrides[variable.id];
-              const merged: Record<string, any> = {};
-              col.modes.forEach(mode => {
-                const parentValues = variable.valuesByMode as Record<string, any>;
-                if ((mode as any).parentModeId && overridesForVar?.[mode.modeId] !== undefined) {
-                  merged[mode.modeId] = overridesForVar[mode.modeId];
-                } else if ((mode as any).parentModeId && parentValues[(mode as any).parentModeId] !== undefined) {
-                  merged[mode.modeId] = parentValues[(mode as any).parentModeId];
-                }
-              });
-              collectionValues = merged;
-            } else {
-              collectionValues = variable.valuesByMode as Record<string, any>;
-            }
-            varPairs.push({ variable, collectionValues });
-          }));
-
-          const variables: any[] = [];
-          const resolvePromises: Promise<void>[] = [];
-
-          varPairs.forEach(pair => {
-            const valuesByMode: Record<string, any> = {};
-            const resolvedValuesByMode: Record<string, any> = {};
-            const aliasInfo: Record<string, any> = {};
-
-            Object.entries(pair.collectionValues).forEach(([mId, val]: [string, any]) => {
-              valuesByMode[mId] = val;
-              if (val && val.type === 'VARIABLE_ALIAS') {
-                resolvePromises.push(
-                  figma.variables.getVariableByIdAsync(val.id).then(aliasedVar => {
-                    if (aliasedVar) {
-                      const aliasedVarCollection = variableIdToCollection.get(aliasedVar.id);
-                      const aliasPath = _jex_buildAliasPath(aliasedVar, aliasedVarCollection || null, col.name, collections as any[]);
-                      aliasInfo[mId] = { isAlias: true, aliasPath, aliasedVarId: aliasedVar.id, aliasedVarCollection };
-                      const parentVals = aliasedVar.valuesByMode as Record<string, any>;
-                      resolvedValuesByMode[mId] = parentVals[Object.keys(parentVals)[0]] ?? null;
-                    }
-                  })
-                );
-              } else {
-                resolvedValuesByMode[mId] = val;
-              }
-            });
-
-            variables.push({
-              id: pair.variable.id,
-              name: pair.variable.name,
-              type: pair.variable.resolvedType,
-              valuesByMode,
-              resolvedValuesByMode,
-              aliasInfo,
-              codeSyntax: (pair.variable as any).codeSyntax ?? {}
-            });
-          });
-
-          await Promise.all(resolvePromises);
-          return { name: col.name, modes: col.modes, variables };
-        }));
-
+        const colResults = await _jex_extractCollectionsForUI();
         figma.ui.postMessage({ type: 'JSON_EXPORT_EXTRACTED', collections: colResults });
+      } catch (e: any) {
+        figma.ui.postMessage({ type: 'JSON_EXPORT_ERROR', message: e.message });
+      }
+    })();
+  }
+
+  else if (msg.type === 'JSON_EXPORT_THEME_SOURCE') {
+    (async () => {
+      try {
+        const collections = await _jex_extractCollectionsForUI();
+        figma.ui.postMessage({ type: 'JSON_EXPORT_THEME_SOURCE_READY', collections });
       } catch (e: any) {
         figma.ui.postMessage({ type: 'JSON_EXPORT_ERROR', message: e.message });
       }
@@ -2289,14 +3317,23 @@ figma.ui.onmessage = async (msg) => {
 
   else if (msg.type === 'JSON_EXPORT_TRANSFORM') {
     try {
-      const result = _jex_transformToFinalFormat(msg.raw);
+      const nativeResult = _jex_transformToFinalFormat(msg.raw);
+      const exportMode = msg.exportMode || 'token-studio';
+      let finalTokens: any;
+      if (exportMode === 'token-studio') {
+        finalTokens = _jex_toTokenStudioFormat(nativeResult.tokens, msg.raw);
+      } else {
+        finalTokens = nativeResult.tokens;
+      }
+      const topLevelCollections = Object.keys(finalTokens).filter(k => !k.startsWith('$')).length;
       figma.ui.postMessage({
         type: 'JSON_EXPORT_TRANSFORMED',
-        payload: result,
+        payload: { tokens: finalTokens, count: nativeResult.count },
         validation: {
-          actual: { totalTokens: result.count, topLevelCollections: Object.keys(result.tokens).length },
+          actual: { totalTokens: nativeResult.count, topLevelCollections },
           matchPercentage: 100
-        }
+        },
+        exportMode
       });
     } catch (e: any) {
       figma.ui.postMessage({ type: 'JSON_EXPORT_ERROR', message: e.message });
@@ -3119,10 +4156,16 @@ function rgbaToHex(color: { r: number; g: number; b: number; a?: number }): stri
  * Resolve a COLOR variable to a hex value.
  * Follows alias chains so extension/alias tokens can still preview color.
  */
+/**
+ * modeNameMap: optional Map<modeId, modeName> built from all collections.
+ * When present, we prefer the mode whose name contains "neutral" (case-insensitive)
+ * so that foundation color values are always resolved through the Neutral scheme.
+ */
 async function getVariableColorHex(
   variable: Variable,
   cache?: Map<string, string | undefined>,
-  visited?: Set<string>
+  visited?: Set<string>,
+  modeNameMap?: Map<string, string>
 ): Promise<string | undefined> {
   if (variable.resolvedType !== 'COLOR') return undefined;
   const id = variable.id;
@@ -3135,7 +4178,15 @@ async function getVariableColorHex(
   try {
     const modeIds = Object.keys(variable.valuesByMode || {});
     if (modeIds.length === 0) return undefined;
-    const value = variable.valuesByMode[modeIds[0]];
+
+    // Prefer the Neutral mode when resolving foundation / scheme variables.
+    let selectedModeId = modeIds[0];
+    if (modeNameMap && modeIds.length > 1) {
+      const neutralId = modeIds.find(mid => /neutral/i.test(modeNameMap.get(mid) || ''));
+      if (neutralId) selectedModeId = neutralId;
+    }
+
+    const value = variable.valuesByMode[selectedModeId];
     if (value && typeof value === 'object' && 'r' in value && 'g' in value && 'b' in value) {
       const hex = rgbaToHex(value as { r: number; g: number; b: number });
       if (cache) cache.set(id, hex);
@@ -3147,7 +4198,7 @@ async function getVariableColorHex(
       if (cache && cache.has(targetId)) return cache.get(targetId);
       const targetVar = await figma.variables.getVariableByIdAsync(targetId);
       if (!targetVar) return undefined;
-      const resolved = await getVariableColorHex(targetVar, cache, seen);
+      const resolved = await getVariableColorHex(targetVar, cache, seen, modeNameMap);
       if (cache) cache.set(id, resolved);
       return resolved;
     }
@@ -3156,6 +4207,99 @@ async function getVariableColorHex(
   }
   if (cache) cache.set(id, undefined);
   return undefined;
+}
+
+/**
+ * Resolve a COLOR variable to hex starting from a specific collection mode (follows aliases).
+ */
+async function getVariableColorHexForMode(
+  variable: Variable,
+  modeId: string,
+  depth = 0,
+): Promise<string | undefined> {
+  if (depth > 12 || variable.resolvedType !== 'COLOR') return undefined;
+  try {
+    const modes = (variable.valuesByMode || {}) as Record<string, unknown>;
+    let mid = modeId;
+    if (!mid || modes[mid] === undefined) mid = Object.keys(modes)[0] ?? '';
+    if (!mid) return undefined;
+    const raw = modes[mid];
+    if (raw && typeof raw === 'object' && 'r' in raw && 'g' in raw && 'b' in raw) {
+      return rgbaToHex(raw as { r: number; g: number; b: number });
+    }
+    if (isVariableAliasValue(raw)) {
+      const targetId = (raw as { id?: string }).id;
+      if (!targetId) return undefined;
+      const targetVar = await figma.variables.getVariableByIdAsync(targetId);
+      if (!targetVar) return undefined;
+      const nextMid =
+        Object.keys((targetVar.valuesByMode || {}) as Record<string, unknown>)[0] ?? mid;
+      return getVariableColorHexForMode(targetVar, nextMid, depth + 1);
+    }
+  } catch (_) {
+    // ignore
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a FLOAT variable's value by following VARIABLE_ALIAS chains.
+ * Prefers a mode whose name contains "neutral" (case-insensitive) if
+ * modeNameMap is provided; otherwise uses the first available mode.
+ */
+async function resolveVariableFloat(
+  variable: Variable,
+  modeNameMap?: Map<string, string>,
+  visited?: Set<string>,
+): Promise<number | null> {
+  const seen = visited ?? new Set<string>();
+  if (seen.has(variable.id)) return null;
+  seen.add(variable.id);
+  try {
+    const modes = Object.keys(variable.valuesByMode ?? {});
+    if (modes.length === 0) return null;
+    let mid = modes[0];
+    if (modeNameMap && modes.length > 1) {
+      const nm = modes.find(m => /neutral/i.test(modeNameMap.get(m) ?? ''));
+      if (nm) mid = nm;
+    }
+    const val = (variable.valuesByMode as Record<string, unknown>)[mid];
+    if (typeof val === 'number') return val;
+    if (val && typeof val === 'object' && (val as any).type === 'VARIABLE_ALIAS') {
+      const targetId = (val as any).id as string | undefined;
+      if (!targetId) return null;
+      const target = await figma.variables.getVariableByIdAsync(targetId);
+      if (!target) return null;
+      return resolveVariableFloat(target, modeNameMap, seen);
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Resolve a STRING variable's value by following VARIABLE_ALIAS chains.
+ */
+async function resolveVariableString(
+  variable: Variable,
+  visited?: Set<string>,
+): Promise<string | null> {
+  const seen = visited ?? new Set<string>();
+  if (seen.has(variable.id)) return null;
+  seen.add(variable.id);
+  try {
+    const modes = Object.keys(variable.valuesByMode ?? {});
+    if (modes.length === 0) return null;
+    const val = (variable.valuesByMode as Record<string, unknown>)[modes[0]];
+    if (typeof val === 'string') return val;
+    if (val && typeof val === 'object' && (val as any).type === 'VARIABLE_ALIAS') {
+      const targetId = (val as any).id as string | undefined;
+      if (!targetId) return null;
+      const target = await figma.variables.getVariableByIdAsync(targetId);
+      if (!target) return null;
+      return resolveVariableString(target, seen);
+    }
+  } catch (_) { /* ignore */ }
+  return null;
 }
 
 /**
@@ -3258,7 +4402,10 @@ function getVariableSourceValue(variable: Variable): string {
   if (variable.resolvedType === 'COLOR' && raw && typeof raw === 'object' && 'r' in (raw as object)) {
     return rgbaToHex(raw as { r: number; g: number; b: number; a?: number });
   }
-  if (variable.resolvedType === 'FLOAT' || variable.resolvedType === 'STRING' || variable.resolvedType === 'BOOLEAN') {
+  if (variable.resolvedType === 'FLOAT' && typeof raw === 'number') {
+    return formatTypographicFloatDisplay(variable.name, raw);
+  }
+  if (variable.resolvedType === 'STRING' || variable.resolvedType === 'BOOLEAN') {
     return String(raw);
   }
   return String(raw);
@@ -3287,6 +4434,112 @@ function hasExtensionKeyword(name: string): boolean {
 
 function isVariableAliasValue(raw: unknown): boolean {
   return !!raw && typeof raw === 'object' && (raw as { type?: string }).type === 'VARIABLE_ALIAS';
+}
+
+const WIZ_PATH_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+/**
+ * Tie-break when two variables share no `variableIds` index: compare each `/` segment,
+ * case-insensitive + numeric per segment.
+ */
+function compareVariablePathName(a: string, b: string): number {
+  const as = (a || '').split('/').filter(Boolean);
+  const bs = (b || '').split('/').filter(Boolean);
+  const n = Math.max(as.length, bs.length);
+  for (let i = 0; i < n; i++) {
+    const ca = as[i];
+    const cb = bs[i];
+    if (ca === undefined) return -1;
+    if (cb === undefined) return 1;
+    const c = WIZ_PATH_COLLATOR.compare(ca, cb);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+/**
+ * Match Figma’s Variables sidebar order: `VariableCollection.variableIds` is the canonical order.
+ */
+function sortVariablesLikeFigmaPanel(variables: Variable[], collection: VariableCollection): void {
+  const order = new Map<string, number>();
+  collection.variableIds.forEach((id, i) => order.set(id, i));
+  const FALLBACK = 1_000_000;
+  variables.sort((a, b) => {
+    const ia = order.get(a.id) ?? FALLBACK;
+    const ib = order.get(b.id) ?? FALLBACK;
+    if (ia !== ib) return ia - ib;
+    return compareVariablePathName(a.name, b.name);
+  });
+}
+
+/** Collections excluded from the semantic-colors wizard (not shown as tabs or default table). */
+function isSemanticWizardExcludedCollection(name: string): boolean {
+  const n = (name || '').trim();
+  return n === '.scheme' || n.toLowerCase() === 'scheme';
+}
+
+/** First hop from `modeId` lands on a variable in `coreCollId` (direct link to .core). */
+async function isDirectColorAliasToCore(
+  variable: Variable,
+  modeId: string,
+  coreCollId: string,
+): Promise<boolean> {
+  if (variable.resolvedType !== 'COLOR') return false;
+  const modes = (variable.valuesByMode || {}) as Record<string, unknown>;
+  let mid = modeId;
+  if (!mid || modes[mid] === undefined) mid = Object.keys(modes)[0] ?? '';
+  if (!mid) return false;
+  const raw = modes[mid];
+  if (!isVariableAliasValue(raw)) return false;
+  const tid = (raw as { id?: string }).id;
+  if (!tid) return false;
+  const target = await figma.variables.getVariableByIdAsync(tid);
+  return target !== null && target.variableCollectionId === coreCollId;
+}
+
+/**
+ * Walk a COLOR variable's alias chain from `modeId` until a `.core` target, primitive RGB, or dead end.
+ * Returns the `.core` variable id at chain end (for dropdown) and labels for UI ("a → b → core/…").
+ */
+async function followColorAliasChainToCore(
+  startVar: Variable,
+  modeId: string,
+  coreCollId: string,
+  maxDepth: number,
+): Promise<{
+  coreTargetId: string | null;
+  chainLabels: string[];
+  hasRawPrimitive: boolean;
+}> {
+  const chainLabels: string[] = [];
+  let current: Variable | null = startVar;
+  let mid = modeId;
+  for (let d = 0; d < maxDepth && current; d++) {
+    const modes = (current.valuesByMode || {}) as Record<string, unknown>;
+    if (!mid || modes[mid] === undefined) mid = Object.keys(modes)[0] ?? '';
+    if (!mid) break;
+    const raw = modes[mid];
+    if (raw && typeof raw === 'object' && 'r' in raw && 'g' in raw && 'b' in raw) {
+      return { coreTargetId: null, chainLabels, hasRawPrimitive: true };
+    }
+    if (!isVariableAliasValue(raw)) {
+      return { coreTargetId: null, chainLabels, hasRawPrimitive: false };
+    }
+    const tid = (raw as { id: string }).id;
+    const next = await figma.variables.getVariableByIdAsync(tid);
+    if (!next) break;
+    chainLabels.push(next.name || tid);
+    if (next.variableCollectionId === coreCollId) {
+      return { coreTargetId: next.id, chainLabels, hasRawPrimitive: false };
+    }
+    current = next;
+    mid = Object.keys((next.valuesByMode || {}) as Record<string, unknown>)[0] ?? mid;
+  }
+  return { coreTargetId: null, chainLabels, hasRawPrimitive: false };
+}
+
+function isRemoteCollection(c: VariableCollection): boolean {
+  return !!(c as { remote?: boolean }).remote;
 }
 
 function isMasterLinkedVariable(variable: Variable, collectionName: string): boolean {
@@ -3333,7 +4586,6 @@ function isCoreSemanticCollectionName(collectionName: string): boolean {
   const n = (collectionName || '').toLowerCase();
   return (
     n.includes('semantic') ||
-    n.includes('foundation') ||
     n.includes('primitive') ||
     n.includes('primitives') ||
     n.includes('core') ||
@@ -3478,6 +4730,15 @@ async function scanDocumentVariables(): Promise<void> {
     const collections = await figma.variables.getLocalVariableCollectionsAsync();
     const colorHexCache = new Map<string, string | undefined>();
 
+    // Build modeId → modeName map so getVariableColorHex can prefer "Neutral" modes
+    // when resolving alias chains through scheme collections.
+    const modeNameMap = new Map<string, string>();
+    for (const col of collections) {
+      for (const mode of (col as any).modes || []) {
+        if (mode.modeId && mode.name) modeNameMap.set(mode.modeId, mode.name);
+      }
+    }
+
     if (collections.length === 0) {
       figma.ui.postMessage({
         type: 'SCAN_COMPLETE',
@@ -3491,6 +4752,56 @@ async function scanDocumentVariables(): Promise<void> {
     // DS Context Maturity accumulators
     const allDSVars: DSVariable[] = [];
     const allDSCollections: DSCollection[] = [];
+
+    // ── RADD System Detection + Architecture Rule Check ───────────────────
+    // Runs once per scan, before the per-collection loop.
+    // Loads all variables in a single batch for the alias-chain checks.
+    let systemInfo: SystemInfo | null = null;
+    let architectureViolations: RuleViolation[] = [];
+    try {
+      const allVarsForRules = await figma.variables.getLocalVariablesAsync();
+      const collectionNames = collections.map((c: any) => c.name as string);
+      systemInfo = detectRADDSystem(collectionNames);
+
+      figma.ui.postMessage({
+        type: 'SCAN_PROGRESS',
+        message: `System detected: ${systemLabel(systemInfo)} — running architecture checks…`,
+      });
+
+      if (systemInfo.version !== 'unknown') {
+        const slimVars: FigmaVarSlim[] = allVarsForRules.map(v => ({
+          id: v.id,
+          name: v.name,
+          variableCollectionId: v.variableCollectionId,
+          resolvedType: v.resolvedType,
+          valuesByMode: v.valuesByMode as Record<string, unknown>,
+        }));
+        const slimColls: FigmaCollectionSlim[] = collections.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          modes: c.modes.map((m: any) => ({ modeId: m.modeId, name: m.name || '' })),
+          variableIds: [...(c.variableIds as string[])],
+        }));
+        architectureViolations = runFoundationRules({
+          version: systemInfo.version,
+          vars: slimVars,
+          collections: slimColls,
+        });
+        figma.ui.postMessage({
+          type: 'SCAN_PROGRESS',
+          message: `Architecture check complete — ${architectureViolations.length} issue(s) found`,
+        });
+      }
+
+      // Post system info so the UI can display it
+      figma.ui.postMessage({
+        type: 'SYSTEM_DETECTED',
+        systemInfo,
+        violationCount: architectureViolations.length,
+      });
+    } catch (ruleErr) {
+      console.warn('[FoundationRules] Rule check failed (non-blocking):', ruleErr);
+    }
 
     for (const collection of collections) {
       await yieldToEventLoop();
@@ -3547,11 +4858,30 @@ async function scanDocumentVariables(): Promise<void> {
       // Token maturity: use reverse index if available (T7: empty is ok)
       const revIndex = reverseIndexCache || {};
 
+      // ── Foundation description conformance: build a document varMap ──────
+      // Only paid once per scan run, only when the foundation collection is present.
+      let foundationVarMap: Record<string, FoundationVariable> | null = null;
+      if (collection.name === 'foundation') {
+        const allDocVars = await figma.variables.getLocalVariablesAsync();
+        foundationVarMap = {};
+        for (const dv of allDocVars) {
+          foundationVarMap[dv.id] = {
+            id: dv.id,
+            name: dv.name,
+            description: dv.description || '',
+            resolvedType: dv.resolvedType as FoundationVariable['resolvedType'],
+            scopes: (dv as any).scopes || [],
+            valuesByMode: dv.valuesByMode || {},
+            variableCollectionId: dv.variableCollectionId,
+          };
+        }
+      }
+
       for (let vi = 0; vi < variables.length; vi++) {
         if (vi % 10 === 0) await yieldToEventLoop(); // yield every 10 items
         if (scanCancelled) break;
         const variable = variables[vi];
-        const colorHex = await getVariableColorHex(variable, colorHexCache);
+        const colorHex = await getVariableColorHex(variable, colorHexCache, undefined, modeNameMap);
 
         // ── Cache for DS Context Maturity ──
         allDSVars.push({
@@ -3667,8 +4997,26 @@ async function scanDocumentVariables(): Promise<void> {
             notionViolatedCount: mr.notionViolatedCount,
           };
 
-          // The new engine always produces a description when score < 0.5
-          if (mr.description && mr.description.length > 0) {
+          // For foundation collection: override suggestion with the deterministic 4-slot description
+          if (foundationVarMap) {
+            const foundVar: FoundationVariable = {
+              id: variable.id,
+              name: variable.name,
+              description: variable.description || '',
+              resolvedType: variable.resolvedType as FoundationVariable['resolvedType'],
+              scopes: (variable as any).scopes || [],
+              valuesByMode: variable.valuesByMode || {},
+              variableCollectionId: variable.variableCollectionId,
+            };
+            const { description: formulaDesc, validationErrors: formulaErrs } =
+              generateFoundationDescription(foundVar, foundationVarMap);
+            if (formulaDesc && formulaErrs.length === 0) {
+              issueObj.suggestedValue = formulaDesc;
+              issueObj.suggestedValueFormatted = formulaDesc;
+              issueObj.foundationFormulaUsed = true;
+            }
+          } else if (mr.description && mr.description.length > 0) {
+            // The new engine always produces a description when score < 0.5
             issueObj.suggestedValue = mr.description;
             issueObj.suggestedValueFormatted = mr.description;
           }
@@ -3680,6 +5028,58 @@ async function scanDocumentVariables(): Promise<void> {
           if (bakedMatch) issueObj.bakedRuleMeaning = bakedMatch.meaning;
           Object.assign(issueObj, tokenMaturityAttach);
           issues.push(issueObj as Issue);
+        }
+
+        // ── Foundation: flag non-conformant existing descriptions ────────────
+        // Only runs for foundation collection variables that already have a description.
+        // Validates against the 4-slot formula and raises a fixable 'poor' issue when
+        // the existing text fails one or more quality rules.
+        if (hasDescription && foundationVarMap) {
+          const foundVar: FoundationVariable = {
+            id: variable.id,
+            name: variable.name,
+            description: variable.description || '',
+            resolvedType: variable.resolvedType as FoundationVariable['resolvedType'],
+            scopes: (variable as any).scopes || [],
+            valuesByMode: variable.valuesByMode || {},
+            variableCollectionId: variable.variableCollectionId,
+          };
+          const conformanceErrors = validateFoundationDescription(
+            variable.description || '',
+            foundVar,
+            foundationVarMap
+          );
+          if (conformanceErrors.length > 0) {
+            // Generate a conforming replacement
+            const { description: rewrittenDesc, validationErrors: rewriteErrs } =
+              generateFoundationDescription(foundVar, foundationVarMap);
+
+            const conformIssue: any = {
+              id: `${variable.id}-desc-nonconformant`,
+              category: 'poor',
+              severity: 'warning',
+              message: 'Description needs work in order to follow the rules of the overall Design System',
+              suggestion: conformanceErrors.join('; '),
+              contextPoint: 'Variable',
+              nodeId: variable.id,
+              nodeName: variable.name,
+              nodeType: 'Variable',
+              fixable: true,   // always show the edit textarea — user can also type manually
+              propertyPath: 'description',
+              resolvedType: variable.resolvedType,
+              sourceValue: variable.description || '',
+              tokenScopes: (variable as any).scopes || [],
+              collectionName: collection.name,
+              foundationConformanceErrors: conformanceErrors,
+              ...tokenMaturityAttach,
+            };
+            if (rewrittenDesc && rewriteErrs.length === 0) {
+              conformIssue.suggestedValue = rewrittenDesc;
+              conformIssue.suggestedValueFormatted = rewrittenDesc;
+            }
+            if (colorHex) conformIssue.colorHex = colorHex;
+            issues.push(conformIssue as Issue);
+          }
         }
       }
 
@@ -3725,11 +5125,50 @@ async function scanDocumentVariables(): Promise<void> {
       }
     }
 
+    // ── Append architecture violations as a synthetic audit ──────────────
+    if (architectureViolations.length > 0) {
+      const archIssues: Issue[] = architectureViolations.map(v => ({
+        id: `arch-${v.ruleId}-${v.variableId}`,
+        category: v.severity === 'critical' ? 'inconsistent' : 'poor',
+        severity: v.severity === 'critical' ? 'critical' : v.severity === 'warning' ? 'warning' : 'info',
+        message: v.message,
+        suggestion: v.suggestion,
+        contextPoint: 'Architecture',
+        nodeId: v.variableId,
+        nodeName: v.variableName,
+        nodeType: 'Variable',
+        fixable: false,
+        ruleId: v.ruleId,
+        collectionName: v.collectionName,
+        ...(v.sfId ? { sfId: v.sfId } : {}),
+      } as Issue & { collectionName: string; sfId?: string }));
+
+      audits.push({
+        nodeId: 'architecture-check',
+        nodeName: `Architecture — ${systemInfo ? systemLabel(systemInfo) : 'RADD'}`,
+        nodeType: 'VariableCollection',
+        score: Math.max(0, 100 - archIssues.filter(i => i.severity === 'critical').length * 20 - archIssues.filter(i => i.severity === 'warning').length * 8),
+        checks: {
+          hasDescription: true, hasVariants: false, hasProperties: false,
+          hasDocumentation: false, hasDocumentationLink: false, properNaming: true,
+          hasLayerNames: true, hasPropertyDescriptions: false, hasVariantDescriptions: false,
+        },
+        issues: archIssues,
+        properties: [],
+        variants: [],
+      });
+    }
+
     figma.ui.postMessage({
       type: 'SCAN_COMPLETE',
       audits,
       timestamp: new Date().toISOString(),
-      meta: { scanType: 'variables', usedReverseIndex: !!reverseIndexCache },
+      meta: {
+        scanType: 'variables',
+        usedReverseIndex: !!reverseIndexCache,
+        raddVersion: systemInfo?.version ?? 'unknown',
+        architectureViolations: architectureViolations.length,
+      },
     });
 
     // Cache for DS Context Maturity and attempt file-level scoring
@@ -4606,6 +6045,27 @@ function extractAINodeMeta(node: SceneNode, depth: number): Record<string, unkno
 // Learning Layer Message Handlers
 // ============================================================================
 
+// ── WIZARD: Module-level undo stack ────────────────────────────────────────
+// Declared at module scope so it persists across message invocations and is
+// never re-initialised. Stack is capped at 5 snapshots, cleared on plugin reload.
+interface WizUndoSnapshot {
+  label: string;
+  vars: Array<{ id: string; modeId: string; value: RGBA | VariableAlias | undefined }>;
+}
+const _wizSnapshots: WizUndoSnapshot[] = [];
+
+async function _wizSnapAndPush(label: string, variables: Variable[], modeId: string): Promise<void> {
+  const snapshot = variables.map(v => ({
+    id: v.id,
+    modeId,
+    value: v.valuesByMode[modeId] as RGBA | VariableAlias | undefined,
+  }));
+  _wizSnapshots.push({ label, vars: snapshot });
+  if (_wizSnapshots.length > 5) _wizSnapshots.shift();
+  console.log('[wizard-undo] snapshot pushed:', label, 'vars=' + snapshot.length, 'stack=' + _wizSnapshots.length);
+  figma.ui.postMessage({ type: 'WIZARD_UNDO_COUNT', count: _wizSnapshots.length });
+}
+
 // Appended to the existing figma.ui.onmessage handler via a secondary listener.
 // These handlers are additive — they do not replace the primary handler above.
 figma.ui.on('message', async (msg: { type: string; [key: string]: unknown }) => {
@@ -4838,6 +6298,1281 @@ figma.ui.on('message', async (msg: { type: string; [key: string]: unknown }) => 
       msg.componentType as string | undefined
     );
     figma.ui.postMessage({ type: 'EXTERNAL_KNOWLEDGE_DATA', entries });
+    return;
+  }
+
+  // ── GENERATE_FOUNDATION_DESCRIPTIONS (dry-run) ───────────────────────────
+  // Generates descriptions for all variables in the 'foundation' collection
+  // and returns a report without writing anything.
+  // msg.force — boolean: when true, also generate for vars that already have descriptions
+  if (msg.type === 'GENERATE_FOUNDATION_DESCRIPTIONS') {
+    try {
+      const collections = await figma.variables.getLocalVariableCollectionsAsync();
+      const allVars = await figma.variables.getLocalVariablesAsync();
+
+      const foundationColl = collections.find(c => c.name === 'foundation');
+      if (!foundationColl) {
+        figma.ui.postMessage({
+          type: 'FOUNDATION_DESCRIPTIONS_ERROR',
+          error: 'No collection named "foundation" found in this file.',
+        });
+        return;
+      }
+
+      const varMap: Record<string, FoundationVariable> = {};
+      for (const v of allVars) {
+        varMap[v.id] = {
+          id: v.id,
+          name: v.name,
+          description: v.description,
+          resolvedType: v.resolvedType as FoundationVariable['resolvedType'],
+          scopes: v.scopes as string[],
+          valuesByMode: v.valuesByMode as Record<string, unknown>,
+          variableCollectionId: v.variableCollectionId,
+        };
+      }
+
+      const foundVars = allVars
+        .filter(v => v.variableCollectionId === foundationColl.id)
+        .map(v => varMap[v.id]);
+
+      const force = msg.force === true;
+      const results = generateFoundationDescriptions(foundVars, varMap, force);
+      const report = buildRunReport(results);
+
+      figma.ui.postMessage({
+        type: 'FOUNDATION_DESCRIPTIONS_PREVIEW',
+        report,
+        results,
+      });
+    } catch (err) {
+      console.error('[FoundationGen] Dry-run failed:', err);
+      figma.ui.postMessage({
+        type: 'FOUNDATION_DESCRIPTIONS_ERROR',
+        error: String(err),
+      });
+    }
+    return;
+  }
+
+  // ── WRITE_FOUNDATION_DESCRIPTIONS ────────────────────────────────────────
+  // Writes the approved descriptions (from a prior dry-run) to Figma variables.
+  // msg.approved — Array<{ varId: string; description: string }>
+  if (msg.type === 'WRITE_FOUNDATION_DESCRIPTIONS') {
+    try {
+      const approved = (msg.approved as Array<{ varId: string; description: string }>) ?? [];
+      let written = 0;
+      const errors: Array<{ varId: string; error: string }> = [];
+
+      // Chunk to avoid blocking the main thread
+      const chunkSize = 50;
+      for (let i = 0; i < approved.length; i += chunkSize) {
+        const chunk = approved.slice(i, i + chunkSize);
+        for (const { varId, description } of chunk) {
+          try {
+            const variable = await figma.variables.getVariableByIdAsync(varId);
+            if (!variable) {
+              errors.push({ varId, error: 'Variable not found' });
+              continue;
+            }
+            variable.description = description;
+            written++;
+          } catch (e: unknown) {
+            errors.push({ varId, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+
+      figma.ui.postMessage({
+        type: 'FOUNDATION_DESCRIPTIONS_WRITTEN',
+        written,
+        errors,
+      });
+    } catch (err) {
+      console.error('[FoundationGen] Write failed:', err);
+      figma.ui.postMessage({
+        type: 'FOUNDATION_DESCRIPTIONS_ERROR',
+        error: String(err),
+      });
+    }
+    return;
+  }
+
+  // ── WIZARD: DETECT_ARCHITECTURE ──────────────────────────────────────────
+  if (msg.type === 'WIZARD_DETECT_ARCHITECTURE') {
+    try {
+      const arch = await detectFileArchitecture();
+      figma.ui.postMessage({ type: 'WIZARD_ARCHITECTURE', data: arch });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'detect_architecture', error: String(err) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GENERATE_SHADES ───────────────────────────────────────────────
+  if (msg.type === 'WIZARD_GENERATE_SHADES') {
+    try {
+      const palette = generateTonalPalette(String(msg.seedHex ?? ''));
+      const shades  = generateShadeScale(String(msg.seedHex ?? ''));
+      // context is echoed back so the UI knows which palette preview to update
+      figma.ui.postMessage({ type: 'WIZARD_SHADES', palette, shades, context: msg.context ?? 'brand' });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'generate_shades', error: String(err) });
+    }
+    return;
+  }
+
+  // ── WIZARD: APPLY_FULL_CONFIG ─────────────────────────────────────────────
+  if (msg.type === 'WIZARD_APPLY_CONFIG') {
+    try {
+      const result = await wizardApplyFullConfig(msg.config as WizardConfig);
+      figma.ui.postMessage({ type: 'WIZARD_CONFIG_APPLIED', data: result });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'apply_config', error: String(err) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GET_FOUNDATION_COLORS ────────────────────────────────────────
+  // Reads from '.core': brand seed color (COLOR) and font family (STRING under font-family/).
+  // Returns: { seedColor?, fontFamily? }
+  if (msg.type === 'WIZARD_GET_FOUNDATION_COLORS') {
+    try {
+      const wizColls = await figma.variables.getLocalVariableCollectionsAsync();
+
+      // Build modeId → modeName map
+      const wizModeNameMap = new Map<string, string>();
+      for (const col of wizColls) {
+        for (const mode of (col as any).modes || []) {
+          if (mode.modeId && mode.name) wizModeNameMap.set(mode.modeId, mode.name);
+        }
+      }
+
+      const wizAllVars = await figma.variables.getLocalVariablesAsync();
+      const wizCache = new Map<string, string | undefined>();
+
+      // ── Read font families from .core only (brand color is now fetched separately) ──
+      let fontFamily: string | undefined;
+      let fontFamilySecondary: string | undefined;
+      const coreColl = wizColls.find((c: any) => c.name === '.core') ??
+                       wizColls.find((c: any) => c.name === 'core');
+      if (coreColl) {
+        const fonts = await readFontFamiliesFromCore(coreColl);
+        fontFamily = fonts.primary;
+        fontFamilySecondary = fonts.secondary;
+      }
+
+      figma.ui.postMessage({ type: 'WIZARD_FOUNDATION_COLORS', fontFamily, fontFamilySecondary });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'get_foundation_colors', error: String(err) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GET_FILE_NAME ─────────────────────────────────────────────────
+  // The UI can request the current file name at any time (e.g. to display in the header).
+  // Also returns the saved DS display name (if any) so the wizard can show it.
+  if (msg.type === 'WIZARD_GET_FILE_NAME') {
+    figma.clientStorage.getAsync(DS_SETTINGS_STORAGE_KEY).then((stored: unknown) => {
+      const config = stored && typeof stored === 'object' ? stored as Record<string, unknown> : {};
+      const savedName = typeof config.name === 'string' ? config.name.trim() : '';
+      figma.ui.postMessage({ type: 'WIZARD_FILE_NAME', name: figma.root.name || '', savedName });
+    }).catch(() => {
+      figma.ui.postMessage({ type: 'WIZARD_FILE_NAME', name: figma.root.name || '', savedName: '' });
+    });
+    return;
+  }
+
+  // ── WIZARD: SAVE_DS_NAME ──────────────────────────────────────────────────
+  // Saves only the DS display name, merging into existing settings.
+  if (msg.type === 'WIZARD_SAVE_DS_NAME') {
+    const newName = String((msg as any).name || '').trim();
+    figma.clientStorage.getAsync(DS_SETTINGS_STORAGE_KEY).then((stored: unknown) => {
+      const config: Record<string, unknown> = stored && typeof stored === 'object' ? { ...(stored as object) } : {};
+      config.name = newName;
+      return figma.clientStorage.setAsync(DS_SETTINGS_STORAGE_KEY, config).then(() => config);
+    }).then((config: Record<string, unknown>) => {
+      figma.ui.postMessage({ type: 'WIZARD_DS_NAME_SAVED', name: newName });
+      // Also update DS_SETTINGS_LOADED so the main header reflects the new name
+      figma.ui.postMessage({ type: 'DS_SETTINGS_LOADED', config, fileName: figma.root.name || '' });
+    }).catch((e: unknown) => {
+      figma.ui.postMessage({ type: 'WIZARD_DS_NAME_ERROR', error: String((e as Error)?.message ?? e) });
+    });
+    return;
+  }
+
+  // ── WIZARD: GET_SECONDARY_COLORS ─────────────────────────────────────────
+  // Scans '.core' collection for variables under the group 'core-colours/secondary/'.
+  // Groups them by sub-folder name (the folder between 'secondary/' and the shade number).
+  // Returns: { secondaries: Array<{ name, hex500, shadeCount, shades: Record<string,string> }> }
+  if (msg.type === 'WIZARD_GET_SECONDARY_COLORS') {
+    try {
+      const secColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const secModeNameMap = new Map<string, string>();
+      for (const c of secColls) {
+        for (const m of c.modes) secModeNameMap.set(m.modeId, m.name);
+      }
+      const coreColl = secColls.find(c => c.name === '.core');
+      if (!coreColl) {
+        figma.ui.postMessage({ type: 'WIZARD_SECONDARY_COLORS', secondaries: [] });
+        return;
+      }
+      const allVars = await figma.variables.getLocalVariablesAsync();
+      const coreVars = allVars.filter(v => v.variableCollectionId === coreColl.id);
+
+      // Collect variables under 'core-colours/secondary/{name}/{shade}'
+      const PREFIX = 'core-colours/secondary/';
+      const groups: Record<string, { shade: string; hex: string }[]> = {};
+
+      for (const v of coreVars) {
+        if (v.resolvedType !== 'COLOR') continue;
+        if (!v.name.startsWith(PREFIX)) continue;
+        const rest = v.name.slice(PREFIX.length); // e.g. "purple/500"
+        const slashIdx = rest.indexOf('/');
+        if (slashIdx < 0) continue;
+        const groupName = rest.slice(0, slashIdx);   // e.g. "purple"
+        const shade     = rest.slice(slashIdx + 1);  // e.g. "500"
+        if (!groups[groupName]) groups[groupName] = [];
+        // resolve hex using the single .core mode
+        const modeId = coreColl.modes[0]?.modeId;
+        const hex = modeId ? await getVariableColorHex(v, undefined, undefined, secModeNameMap) : undefined;
+        groups[groupName].push({ shade, hex: hex ?? '' });
+      }
+
+      const secondaries = Object.keys(groups).sort().map(name => {
+        const shades = groups[name];
+        const shade500 = shades.find(s => s.shade === '500');
+        const hex500 = shade500?.hex ?? shades[0]?.hex ?? '';
+        const shadesMap: Record<string, string> = {};
+        shades.forEach(s => { if (s.shade) shadesMap[s.shade] = s.hex; });
+        return { name, hex500, shadeCount: shades.length, shades: shadesMap };
+      });
+
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_COLORS', secondaries });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_COLORS', secondaries: [], error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: DELETE_SECONDARY ──────────────────────────────────────────────
+  // Deletes all variables in '.core' under core-colours/secondary/{name}/.
+  if (msg.type === 'WIZARD_DELETE_SECONDARY') {
+    try {
+      const delName: string = String(msg.name);
+      const delPrefix = `core-colours/secondary/${delName}/`;
+      const delColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const delCore = delColls.find(c => c.name === '.core');
+      if (!delCore) {
+        figma.ui.postMessage({ type: 'WIZARD_SECONDARY_DELETED', name: delName, ok: false, error: '.core not found' });
+        return;
+      }
+      const delVars = await figma.variables.getLocalVariablesAsync();
+      const toDelete = delVars.filter(v => v.variableCollectionId === delCore.id && v.name.startsWith(delPrefix));
+      for (const v of toDelete) v.remove();
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_DELETED', name: delName, ok: true, count: toDelete.length });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_DELETED', name: msg.name, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: Undo handler ────────────────────────────────────────────────
+  // Pops the most recent snapshot and restores each variable's previous value.
+  if (msg.type === 'WIZARD_UNDO') {
+    console.log('[wizard-undo] UNDO received; stack=' + _wizSnapshots.length);
+    const snap = _wizSnapshots.pop();
+    if (!snap) {
+      console.log('[wizard-undo] stack empty — nothing to undo');
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_COUNT', count: 0 });
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_DONE', label: 'nothing', count: 0 });
+      return;
+    }
+    try {
+      const snapAny = snap as unknown as { _styleSnap?: { styleId: string; field: string; variableId: string | null } };
+      let restoredCount = 0;
+      if (snapAny._styleSnap) {
+        // Restore a text style variable binding
+        const { styleId, field, variableId } = snapAny._styleSnap;
+        const style = await figma.getStyleByIdAsync(styleId);
+        if (style && style.type === 'TEXT') {
+          const ts = style as TextStyle;
+          const oldVar = variableId ? await figma.variables.getVariableByIdAsync(variableId) : null;
+          await figma.loadFontAsync(ts.fontName);
+          ts.setBoundVariable(field as VariableBindableTextField, oldVar);
+          restoredCount = 1;
+        }
+      } else {
+        // Restore variable values
+        const allVars = await figma.variables.getLocalVariablesAsync();
+        for (const entry of snap.vars) {
+          const v = allVars.find(x => x.id === entry.id);
+          if (v && entry.value !== undefined) {
+            v.setValueForMode(entry.modeId, entry.value as RGBA);
+            restoredCount++;
+          }
+        }
+      }
+      console.log('[wizard-undo] restored ' + restoredCount + ' item(s) for "' + snap.label + '"');
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_DONE', label: snap.label, count: _wizSnapshots.length, restored: restoredCount });
+    } catch (e: any) {
+      console.error('[wizard-undo] UNDO error:', e);
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_ERROR', error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: SAVE_SECONDARY ────────────────────────────────────────────────
+  // Writes updated shade hex values back to '.core' under core-colours/secondary/{name}/.
+  // Existing variables are updated; any missing shades are created.
+  if (msg.type === 'WIZARD_SAVE_SECONDARY') {
+    try {
+      const saveName: string = String(msg.name);
+      const saveShades: Record<string, string> = (msg.shades && typeof msg.shades === 'object') ? (msg.shades as Record<string, string>) : {};
+      const saveColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const saveCore = saveColls.find(c => c.name === '.core');
+      if (!saveCore) {
+        figma.ui.postMessage({ type: 'WIZARD_SECONDARY_SAVED', name: saveName, ok: false, error: '.core not found' });
+        return;
+      }
+      const saveModeId = saveCore.modes[0]?.modeId;
+      if (!saveModeId) throw new Error('.core has no modes');
+      const saveVars = await figma.variables.getLocalVariablesAsync();
+      const prefix = `core-colours/secondary/${saveName}/`;
+      // Index existing vars by shade
+      const existing: Record<string, Variable> = {};
+      for (const v of saveVars) {
+        if (v.variableCollectionId === saveCore.id && v.name.startsWith(prefix)) {
+          const shade = v.name.slice(prefix.length);
+          existing[shade] = v;
+        }
+      }
+      // Snapshot current values before overwriting
+      await _wizSnapAndPush(`secondary/${saveName}`, Object.values(existing), saveModeId);
+      const resultShades: Record<string, string> = {};
+      for (const [shade, hexStr] of Object.entries(saveShades)) {
+        if (!/^#[0-9A-Fa-f]{6}$/i.test(hexStr)) continue;
+        const r = parseInt(hexStr.slice(1,3),16)/255;
+        const g = parseInt(hexStr.slice(3,5),16)/255;
+        const b = parseInt(hexStr.slice(5,7),16)/255;
+        const colorVal: RGBA = { r, g, b, a: 1 };
+        let variable = existing[shade];
+        if (!variable) {
+          variable = figma.variables.createVariable(`${prefix}${shade}`, saveCore, 'COLOR');
+        }
+        variable.setValueForMode(saveModeId, colorVal);
+        resultShades[shade] = hexStr.toUpperCase();
+      }
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_SAVED', name: saveName, ok: true, shades: resultShades });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_SECONDARY_SAVED', name: msg.name, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GET_BRAND_COLORS ──────────────────────────────────────────────
+  // Scans '.core' for variables under 'core-colours/brand/Primary/{name}/{shade}'.
+  // Returns the two sub-folders (brand-light, brand-dark) as editable palette groups.
+  if (msg.type === 'WIZARD_GET_BRAND_COLORS') {
+    try {
+      const brColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const brModeNameMap = new Map<string, string>();
+      for (const c of brColls) {
+        for (const m of c.modes) brModeNameMap.set(m.modeId, m.name);
+      }
+      const brCore = brColls.find(c => c.name === '.core') ??
+                     brColls.find(c => c.name === 'core') ??
+                     brColls.find(c => c.name.toLowerCase() === '.core');
+      if (!brCore) {
+        figma.ui.postMessage({ type: 'WIZARD_BRAND_COLORS', brands: [], standalone: [] });
+        return;
+      }
+      const brAllVars = await figma.variables.getLocalVariablesAsync();
+      const brCoreVars = brAllVars.filter(v => v.variableCollectionId === brCore.id);
+
+      // ── Candidate prefixes — checked in priority order ────────────────────
+      // We try the canonical path first, then progressively broader patterns so
+      // alternative architectures (brand-light/ at root, brand/brand-light/, etc.)
+      // are also recognised and displayed the same way.
+      const BRAND_CANDIDATE_PREFIXES = [
+        'core-colours/brand/Primary/',   // canonical: Primary sub-folder
+        'core-colours/brand/',           // no Primary sub-folder
+        'core-colours/brand-light/',     // flat: brand-light at root
+        'core-colours/brand-dark/',      // flat: brand-dark at root
+      ];
+
+      const brGroups: Record<string, { shade: string; hex: string }[]> = {};
+      const brGroupNamed: Record<string, { name: string; hex: string; varName: string }[]> = {};
+      const brStandalone: { name: string; hex: string; varName: string }[] = [];
+
+      // Track which variable IDs have already been processed to avoid double-counting
+      const processedVarIds = new Set<string>();
+
+      for (const prefix of BRAND_CANDIDATE_PREFIXES) {
+        const matching = brCoreVars.filter(
+          v => v.resolvedType === 'COLOR' && v.name.startsWith(prefix) && !processedVarIds.has(v.id)
+        );
+        if (matching.length === 0) continue;
+
+        for (const v of matching) {
+          processedVarIds.add(v.id);
+          const rest = v.name.slice(prefix.length); // e.g. "brand-light/500", "500", "brand"
+          const slashIdx = rest.indexOf('/');
+          const hex = await getVariableColorHex(v, undefined, undefined, brModeNameMap);
+
+          if (slashIdx < 0) {
+            // No sub-folder: determine whether this is a named standalone or belongs to a group
+            // For flat prefixes like core-colours/brand-light/, the group IS the prefix leaf
+            const groupFromPrefix = prefix.replace('core-colours/', '').replace(/\/$/, ''); // e.g. "brand-light"
+            const isFlatGroup = groupFromPrefix.includes('light') || groupFromPrefix.includes('dark');
+            if (isFlatGroup) {
+              // Treat as shade/named token inside the flat group
+              if (isNaN(parseInt(rest, 10))) {
+                if (!brGroupNamed[groupFromPrefix]) brGroupNamed[groupFromPrefix] = [];
+                brGroupNamed[groupFromPrefix].push({ name: rest, hex: hex ?? '', varName: v.name });
+              } else {
+                if (!brGroups[groupFromPrefix]) brGroups[groupFromPrefix] = [];
+                brGroups[groupFromPrefix].push({ shade: rest, hex: hex ?? '' });
+              }
+            } else {
+              brStandalone.push({ name: rest, hex: hex ?? '', varName: v.name });
+            }
+          } else {
+            const groupName = rest.slice(0, slashIdx);
+            const shade     = rest.slice(slashIdx + 1);
+            if (isNaN(parseInt(shade, 10))) {
+              if (!brGroupNamed[groupName]) brGroupNamed[groupName] = [];
+              brGroupNamed[groupName].push({ name: shade, hex: hex ?? '', varName: v.name });
+            } else {
+              if (!brGroups[groupName]) brGroups[groupName] = [];
+              brGroups[groupName].push({ shade, hex: hex ?? '' });
+            }
+          }
+        }
+      }
+
+      // Sort groups: brand-light first, brand-dark second, others alphabetically
+      const sortedKeys = Object.keys(brGroups).sort((a, b) => {
+        const order = (k: string) => k.includes('light') ? 0 : k.includes('dark') ? 1 : 2;
+        return order(a) - order(b);
+      });
+
+      const brands = sortedKeys.map(name => {
+        const shades = brGroups[name];
+        const shade500 = shades.find(s => s.shade === '500');
+        const hex500 = shade500?.hex ?? shades[0]?.hex ?? '';
+        const shadesMap: Record<string, string> = {};
+        shades.forEach(s => { if (s.shade) shadesMap[s.shade] = s.hex; });
+        const namedTokens = brGroupNamed[name] ?? [];
+        return { name, hex500, shadeCount: shades.length, shades: shadesMap, namedTokens };
+      });
+
+      // Debug hint if still nothing found
+      const debugPaths = brands.length === 0 && brStandalone.length === 0
+        ? brCoreVars.filter(v => v.name.toLowerCase().includes('brand')).slice(0, 8).map(v => v.name)
+        : undefined;
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_COLORS', brands, standalone: brStandalone, debugPaths });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_COLORS', brands: [], standalone: [], error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: SAVE_BRAND ────────────────────────────────────────────────────
+  // Writes updated shades to '.core' under core-colours/brand/Primary/{name}/{shade}.
+  if (msg.type === 'WIZARD_SAVE_BRAND') {
+    try {
+      const brSaveName: string = String(msg.name);
+      const brSaveShades: Record<string, string> = (msg.shades && typeof msg.shades === 'object') ? (msg.shades as Record<string, string>) : {};
+      const brSaveColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const brSaveCore = brSaveColls.find(c => c.name === '.core');
+      if (!brSaveCore) {
+        figma.ui.postMessage({ type: 'WIZARD_BRAND_SAVED', name: brSaveName, ok: false, error: '.core not found' });
+        return;
+      }
+      const brSaveModeId = brSaveCore.modes[0]?.modeId;
+      if (!brSaveModeId) throw new Error('.core has no modes');
+      const brSaveVars = await figma.variables.getLocalVariablesAsync();
+      const brPrefix = `core-colours/brand/Primary/${brSaveName}/`;
+      const brExisting: Record<string, Variable> = {};
+      for (const v of brSaveVars) {
+        if (v.variableCollectionId === brSaveCore.id && v.name.startsWith(brPrefix)) {
+          const shade = v.name.slice(brPrefix.length);
+          brExisting[shade] = v;
+        }
+      }
+      await _wizSnapAndPush(`brand/${brSaveName}`, Object.values(brExisting), brSaveModeId);
+      const brResultShades: Record<string, string> = {};
+      for (const [shade, hexStr] of Object.entries(brSaveShades)) {
+        if (!/^#[0-9A-Fa-f]{6}$/i.test(hexStr)) continue;
+        const r = parseInt(hexStr.slice(1,3),16)/255;
+        const g = parseInt(hexStr.slice(3,5),16)/255;
+        const b = parseInt(hexStr.slice(5,7),16)/255;
+        const colorVal: RGBA = { r, g, b, a: 1 };
+        let variable = brExisting[shade];
+        if (!variable) {
+          variable = figma.variables.createVariable(`${brPrefix}${shade}`, brSaveCore, 'COLOR');
+        }
+        variable.setValueForMode(brSaveModeId, colorVal);
+        brResultShades[shade] = hexStr.toUpperCase();
+      }
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_SAVED', name: brSaveName, ok: true, shades: brResultShades });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_SAVED', name: msg.name, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: SAVE_BRAND_TOKEN ──────────────────────────────────────────────
+  // Updates a single standalone token using its exact varName (full path in .core).
+  if (msg.type === 'WIZARD_SAVE_BRAND_TOKEN') {
+    try {
+      const brtName:    string = String(msg.tokenName);  // e.g. "brand"
+      const brtVarName: string = String(msg.varName);    // full path e.g. "core-colours/brand/Primary/brand-light/brand"
+      const brtHex:     string = String(msg.hex ?? '');
+      if (!/^#[0-9A-Fa-f]{6}$/i.test(brtHex)) {
+        figma.ui.postMessage({ type: 'WIZARD_BRAND_TOKEN_SAVED', tokenName: brtName, ok: false, error: 'Invalid hex' });
+        return;
+      }
+      const brtColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const brtCore = brtColls.find(c => c.name === '.core');
+      if (!brtCore) {
+        figma.ui.postMessage({ type: 'WIZARD_BRAND_TOKEN_SAVED', tokenName: brtName, ok: false, error: '.core not found' });
+        return;
+      }
+      const brtModeId = brtCore.modes[0]?.modeId;
+      if (!brtModeId) throw new Error('.core has no modes');
+      const brtAllVars = await figma.variables.getLocalVariablesAsync();
+      let brtVar = brtAllVars.find(v => v.variableCollectionId === brtCore.id && v.name === brtVarName);
+      // Snapshot the existing var (if any) BEFORE overwriting so undo can restore it
+      if (brtVar) await _wizSnapAndPush(`brand-token/${brtName}`, [brtVar], brtModeId);
+      if (!brtVar) brtVar = figma.variables.createVariable(brtVarName, brtCore, 'COLOR');
+      const r = parseInt(brtHex.slice(1,3),16)/255;
+      const g = parseInt(brtHex.slice(3,5),16)/255;
+      const b = parseInt(brtHex.slice(5,7),16)/255;
+      brtVar.setValueForMode(brtModeId, { r, g, b, a: 1 });
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_TOKEN_SAVED', tokenName: brtName, hex: brtHex.toUpperCase(), ok: true });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_BRAND_TOKEN_SAVED', tokenName: msg.tokenName, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GET_FUNCTIONAL_COLORS ────────────────────────────────────────
+  // Scans '.core' collection for variables under 'core-colours/functional/{name}/{shade}'.
+  // Groups by sub-folder name (success, warning, danger, info, etc.).
+  // Returns: { functionals: Array<{ name, hex500, shadeCount, shades: Record<string,string> }> }
+  // ── WIZARD: GET_BASE_COLORS ───────────────────────────────────────────────
+  // Scans '.core' for variables under 'core-colours/base/'.
+  // Sub-folders become editable palette groups; flat tokens become standalone items.
+  if (msg.type === 'WIZARD_GET_BASE_COLORS') {
+    try {
+      const baseColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const baseModeNameMap = new Map<string, string>();
+      for (const c of baseColls) {
+        for (const m of c.modes) baseModeNameMap.set(m.modeId, m.name);
+      }
+      const baseCore = baseColls.find(c => c.name === '.core') ??
+                       baseColls.find(c => c.name === 'core') ??
+                       baseColls.find(c => c.name.toLowerCase() === '.core');
+      if (!baseCore) {
+        figma.ui.postMessage({ type: 'WIZARD_BASE_COLORS', groups: [], standalone: [] });
+        return;
+      }
+      const baseAllVars = await figma.variables.getLocalVariablesAsync();
+      const baseCoreVars = baseAllVars.filter(v => v.variableCollectionId === baseCore.id);
+
+      // Scan both base/ flat tokens and grey/gray/ palette groups
+      const BASE_PREFIXES = [
+        { prefix: 'core-colours/base/',  asGroup: false }, // flat tokens (white, black, …)
+        { prefix: 'core-colours/grey/',  asGroup: true  }, // grey tonal palette
+        { prefix: 'core-colours/gray/',  asGroup: true  }, // alternate spelling
+      ];
+      const baseGroups: Record<string, { shade: string; hex: string }[]> = {};
+      const baseStandalone: { name: string; hex: string; varName: string }[] = [];
+      const baseProcessed = new Set<string>();
+
+      for (const { prefix, asGroup } of BASE_PREFIXES) {
+        for (const v of baseCoreVars) {
+          if (v.resolvedType !== 'COLOR') continue;
+          if (!v.name.startsWith(prefix)) continue;
+          if (baseProcessed.has(v.id)) continue;
+          baseProcessed.add(v.id);
+
+          const rest = v.name.slice(prefix.length);
+          const slashIdx = rest.indexOf('/');
+          const hex = await getVariableColorHex(v, undefined, undefined, baseModeNameMap);
+
+          if (asGroup) {
+            // Everything under grey/ is a palette group.
+            // If no sub-folder: shade is the token name itself (e.g. "500")
+            // If sub-folder: groupName/shade
+            if (slashIdx < 0) {
+              const groupName = prefix.replace('core-colours/', '').replace(/\/$/, ''); // "grey" or "gray"
+              if (!baseGroups[groupName]) baseGroups[groupName] = [];
+              baseGroups[groupName].push({ shade: rest, hex: hex ?? '' });
+            } else {
+              const groupName = rest.slice(0, slashIdx);
+              const shade     = rest.slice(slashIdx + 1);
+              if (!baseGroups[groupName]) baseGroups[groupName] = [];
+              baseGroups[groupName].push({ shade, hex: hex ?? '' });
+            }
+          } else {
+            // base/ — flat standalone or sub-group
+            if (slashIdx < 0) {
+              baseStandalone.push({ name: rest, hex: hex ?? '', varName: v.name });
+            } else {
+              const groupName = rest.slice(0, slashIdx);
+              const shade     = rest.slice(slashIdx + 1);
+              if (!baseGroups[groupName]) baseGroups[groupName] = [];
+              baseGroups[groupName].push({ shade, hex: hex ?? '' });
+            }
+          }
+        }
+      }
+
+      // Sort standalone: named first (white, black, etc.), then numeric ascending
+      baseStandalone.sort((a, b) => {
+        const aNum = parseInt(a.name, 10);
+        const bNum = parseInt(b.name, 10);
+        if (isNaN(aNum) && isNaN(bNum)) return a.name.localeCompare(b.name);
+        if (isNaN(aNum)) return -1;
+        if (isNaN(bNum)) return 1;
+        return aNum - bNum;
+      });
+
+      const groups = Object.keys(baseGroups).sort().map(name => {
+        const shades = baseGroups[name];
+        const shade500 = shades.find(s => s.shade === '500');
+        const hex500 = shade500?.hex ?? shades[0]?.hex ?? '';
+        const shadesMap: Record<string, string> = {};
+        shades.forEach(s => { if (s.shade) shadesMap[s.shade] = s.hex; });
+        return { name, hex500, shadeCount: shades.length, shades: shadesMap };
+      });
+
+      figma.ui.postMessage({ type: 'WIZARD_BASE_COLORS', groups, standalone: baseStandalone });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_BASE_COLORS', groups: [], standalone: [], error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: SAVE_BASE ─────────────────────────────────────────────────────
+  // Writes updated shades or a single token back to '.core' under core-colours/base/.
+  if (msg.type === 'WIZARD_SAVE_BASE') {
+    try {
+      const bsSaveName:   string = String(msg.name);
+      const bsVarName:    string | undefined = msg.varName ? String(msg.varName) : undefined;
+      const bsSaveShades: Record<string, string> = (msg.shades && typeof msg.shades === 'object') ? (msg.shades as Record<string, string>) : {};
+      const bsSingleHex:  string | undefined = msg.hex ? String(msg.hex) : undefined;
+      const bsColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const bsCore = bsColls.find(c => c.name === '.core') ?? bsColls.find(c => c.name === 'core');
+      if (!bsCore) {
+        figma.ui.postMessage({ type: 'WIZARD_BASE_SAVED', name: bsSaveName, ok: false, error: '.core not found' });
+        return;
+      }
+      const bsModeId = bsCore.modes[0]?.modeId;
+      if (!bsModeId) throw new Error('.core has no modes');
+      const bsAllVars = await figma.variables.getLocalVariablesAsync();
+
+      const toRGBA = (hexStr: string): RGBA => {
+        const r = parseInt(hexStr.slice(1,3),16)/255;
+        const g = parseInt(hexStr.slice(3,5),16)/255;
+        const b = parseInt(hexStr.slice(5,7),16)/255;
+        return { r, g, b, a: 1 };
+      };
+
+      if (bsVarName && bsSingleHex && /^#[0-9A-Fa-f]{6}$/i.test(bsSingleHex)) {
+        // Single standalone token save — snapshot the one var
+        let bsVar = bsAllVars.find(v => v.variableCollectionId === bsCore.id && v.name === bsVarName);
+        if (bsVar) await _wizSnapAndPush(`base-token/${bsSaveName}`, [bsVar], bsModeId);
+        if (!bsVar) bsVar = figma.variables.createVariable(bsVarName, bsCore, 'COLOR');
+        bsVar.setValueForMode(bsModeId, toRGBA(bsSingleHex));
+        figma.ui.postMessage({ type: 'WIZARD_BASE_SAVED', name: bsSaveName, varName: bsVarName, hex: bsSingleHex.toUpperCase(), ok: true });
+      } else {
+        // Group palette save — resolve the correct prefix by finding an existing var first
+        const bsCandidatePrefixes = [
+          `core-colours/base/${bsSaveName}/`,
+          `core-colours/grey/${bsSaveName}/`,
+          `core-colours/gray/${bsSaveName}/`,
+          `core-colours/grey/`,
+          `core-colours/gray/`,
+        ];
+        let bsPrefix = `core-colours/base/${bsSaveName}/`;
+        for (const cp of bsCandidatePrefixes) {
+          if (bsAllVars.some(v => v.variableCollectionId === bsCore.id && v.name.startsWith(cp))) {
+            bsPrefix = cp; break;
+          }
+        }
+        const bsExisting: Record<string, Variable> = {};
+        for (const v of bsAllVars) {
+          if (v.variableCollectionId === bsCore.id && v.name.startsWith(bsPrefix)) {
+            bsExisting[v.name.slice(bsPrefix.length)] = v;
+          }
+        }
+        await _wizSnapAndPush(`base/${bsSaveName}`, Object.values(bsExisting), bsModeId);
+        const bsResultShades: Record<string, string> = {};
+        for (const [shade, hexStr] of Object.entries(bsSaveShades)) {
+          if (!/^#[0-9A-Fa-f]{6}$/i.test(hexStr)) continue;
+          let variable = bsExisting[shade];
+          if (!variable) variable = figma.variables.createVariable(`${bsPrefix}${shade}`, bsCore, 'COLOR');
+          variable.setValueForMode(bsModeId, toRGBA(hexStr));
+          bsResultShades[shade] = hexStr.toUpperCase();
+        }
+        figma.ui.postMessage({ type: 'WIZARD_BASE_SAVED', name: bsSaveName, ok: true, shades: bsResultShades });
+      }
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_BASE_SAVED', name: msg.name, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  if (msg.type === 'WIZARD_GET_FUNCTIONAL_COLORS') {
+    try {
+      const fnColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const fnModeNameMap = new Map<string, string>();
+      for (const c of fnColls) {
+        for (const m of c.modes) fnModeNameMap.set(m.modeId, m.name);
+      }
+      const fnCore = fnColls.find(c => c.name === '.core');
+      if (!fnCore) {
+        figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_COLORS', functionals: [] });
+        return;
+      }
+      const fnAllVars = await figma.variables.getLocalVariablesAsync();
+      const fnCoreVars = fnAllVars.filter(v => v.variableCollectionId === fnCore.id);
+
+      const FN_PREFIX = 'core-colours/functional/';
+      const fnGroups: Record<string, { shade: string; hex: string }[]> = {};
+
+      for (const v of fnCoreVars) {
+        if (v.resolvedType !== 'COLOR') continue;
+        if (!v.name.startsWith(FN_PREFIX)) continue;
+        const rest = v.name.slice(FN_PREFIX.length); // e.g. "success/500"
+        const slashIdx = rest.indexOf('/');
+        if (slashIdx < 0) continue;
+        const groupName = rest.slice(0, slashIdx);
+        const shade     = rest.slice(slashIdx + 1);
+        if (!fnGroups[groupName]) fnGroups[groupName] = [];
+        const hex = await getVariableColorHex(v, undefined, undefined, fnModeNameMap);
+        fnGroups[groupName].push({ shade, hex: hex ?? '' });
+      }
+
+      const functionals = Object.keys(fnGroups).sort().map(name => {
+        const shades = fnGroups[name];
+        const shade500 = shades.find(s => s.shade === '500');
+        const hex500 = shade500?.hex ?? shades[0]?.hex ?? '';
+        const shadesMap: Record<string, string> = {};
+        shades.forEach(s => { if (s.shade) shadesMap[s.shade] = s.hex; });
+        return { name, hex500, shadeCount: shades.length, shades: shadesMap };
+      });
+
+      figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_COLORS', functionals });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_COLORS', functionals: [], error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: SAVE_FUNCTIONAL ───────────────────────────────────────────────
+  // Writes updated shade hex values to '.core' under core-colours/functional/{name}/.
+  if (msg.type === 'WIZARD_SAVE_FUNCTIONAL') {
+    try {
+      const fnSaveName: string = String(msg.name);
+      const fnSaveShades: Record<string, string> = (msg.shades && typeof msg.shades === 'object') ? (msg.shades as Record<string, string>) : {};
+      const fnSaveColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const fnSaveCore = fnSaveColls.find(c => c.name === '.core');
+      if (!fnSaveCore) {
+        figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_SAVED', name: fnSaveName, ok: false, error: '.core not found' });
+        return;
+      }
+      const fnSaveModeId = fnSaveCore.modes[0]?.modeId;
+      if (!fnSaveModeId) throw new Error('.core has no modes');
+      const fnSaveVars = await figma.variables.getLocalVariablesAsync();
+      const fnPrefix = `core-colours/functional/${fnSaveName}/`;
+      const fnExisting: Record<string, Variable> = {};
+      for (const v of fnSaveVars) {
+        if (v.variableCollectionId === fnSaveCore.id && v.name.startsWith(fnPrefix)) {
+          const shade = v.name.slice(fnPrefix.length);
+          fnExisting[shade] = v;
+        }
+      }
+      await _wizSnapAndPush(`functional/${fnSaveName}`, Object.values(fnExisting), fnSaveModeId);
+      const fnResultShades: Record<string, string> = {};
+      for (const [shade, hexStr] of Object.entries(fnSaveShades)) {
+        if (!/^#[0-9A-Fa-f]{6}$/i.test(hexStr)) continue;
+        const r = parseInt(hexStr.slice(1,3),16)/255;
+        const g = parseInt(hexStr.slice(3,5),16)/255;
+        const b = parseInt(hexStr.slice(5,7),16)/255;
+        const colorVal: RGBA = { r, g, b, a: 1 };
+        let variable = fnExisting[shade];
+        if (!variable) {
+          variable = figma.variables.createVariable(`${fnPrefix}${shade}`, fnSaveCore, 'COLOR');
+        }
+        variable.setValueForMode(fnSaveModeId, colorVal);
+        fnResultShades[shade] = hexStr.toUpperCase();
+      }
+      figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_SAVED', name: fnSaveName, ok: true, shades: fnResultShades });
+    } catch (e: any) {
+      figma.ui.postMessage({ type: 'WIZARD_FUNCTIONAL_SAVED', name: msg.name, ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+
+  // ── WIZARD: GET_PREVIEW_TOKENS ────────────────────────────────────────────
+  // Reads the exact token values the preview card needs from the 'foundation'
+  // collection, resolving through alias chains using the Neutral mode.
+  // Returns a flat { key: cssValue } map that the UI applies as CSS custom props.
+  if (msg.type === 'WIZARD_GET_PREVIEW_TOKENS') {
+    try {
+      const pvColls = await figma.variables.getLocalVariableCollectionsAsync();
+      const pvModeNameMap = new Map<string, string>();
+      for (const col of pvColls) {
+        for (const mode of (col as any).modes || []) {
+          if (mode.modeId && mode.name) pvModeNameMap.set(mode.modeId, mode.name);
+        }
+      }
+
+      const pvAllVars = await figma.variables.getLocalVariablesAsync();
+      const pvFoundColl = pvColls.find((c: any) => c.name === 'foundation');
+
+      if (!pvFoundColl) {
+        figma.ui.postMessage({ type: 'WIZARD_PREVIEW_TOKENS', tokens: {} });
+        return;
+      }
+
+      // Map: foundation variable name → CSS token key
+      const TOKEN_MAP: Record<string, { key: string; unit?: string }> = {
+        'colours/basic/background':        { key: 'bg' },
+        'colours/basic/background-subtle': { key: 'surface' },
+        'colours/basic/text':              { key: 'text' },
+        'colours/basic/text-recessive':    { key: 'text-muted' },
+        'colours/basic/stroke':            { key: 'stroke' },
+        'radius/medium':                   { key: 'radius',      unit: 'px' },
+        'radius/full':                     { key: 'radius-full', unit: 'px' },
+        'spacing/component/1':             { key: 'space-1',     unit: 'px' },
+        'spacing/component/2':             { key: 'space-2',     unit: 'px' },
+        'spacing/component/3':             { key: 'space-3',     unit: 'px' },
+        'spacing/component/5':             { key: 'space-5',     unit: 'px' },
+        'spacing/component/6':             { key: 'space-6',     unit: 'px' },
+        'typography/title-l/font-family':  { key: 'font-title' },
+        'typography/title-l/size':         { key: 'title-size',  unit: 'px' },
+        'typography/title-l/line-height':  { key: 'title-lh',   unit: 'px' },
+        'typography/title-l/letter-spacing':{ key: 'title-ls',  unit: 'px' },
+        'typography/title-l/weight':       { key: 'title-weight' },
+        'typography/body-s-bold/font-family':{ key: 'font-body-s' },
+        'typography/body-s-bold/size':     { key: 'body-s-size', unit: 'px' },
+        'typography/body-s-bold/line-height':{ key: 'body-s-lh', unit: 'px' },
+        'typography/body-s-bold/weight':   { key: 'body-s-weight' },
+        'typography/body-m-bold/font-family':{ key: 'font-body-m' },
+        'typography/body-m-bold/size':     { key: 'body-m-size', unit: 'px' },
+        'typography/body-m-bold/line-height':{ key: 'body-m-lh', unit: 'px' },
+        'typography/body-m-bold/weight':   { key: 'body-m-weight' },
+      };
+
+      // Build name → variable lookup
+      const pvVarByName: Record<string, Variable> = {};
+      for (const v of pvAllVars) {
+        if (v.variableCollectionId === pvFoundColl.id) pvVarByName[v.name] = v as Variable;
+      }
+
+      const pvColorCache = new Map<string, string | undefined>();
+      const tokens: Record<string, string> = {};
+
+      for (const [tokenName, { key, unit }] of Object.entries(TOKEN_MAP)) {
+        const v = pvVarByName[tokenName];
+        if (!v) continue;
+        try {
+          if (v.resolvedType === 'COLOR') {
+            const hex = await getVariableColorHex(v, pvColorCache, undefined, pvModeNameMap);
+            if (hex) tokens[key] = hex;
+          } else if (v.resolvedType === 'FLOAT') {
+            const num = await resolveVariableFloat(v, pvModeNameMap);
+            if (num !== null) tokens[key] = unit ? `${num}${unit}` : String(num);
+          } else if (v.resolvedType === 'STRING') {
+            const str = await resolveVariableString(v);
+            if (str !== null) tokens[key] = str;
+          }
+        } catch (_) { /* skip this token */ }
+      }
+
+      figma.ui.postMessage({ type: 'WIZARD_PREVIEW_TOKENS', tokens });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_PREVIEW_TOKENS', tokens: {} });
+    }
+    return;
+  }
+
+  // ── WIZARD: Breakpoint typography text styles + tokens (Styles sub-step) ─
+  if (msg.type === 'WIZARD_BP_TYPO_FETCH') {
+    try {
+      const all = await figma.getLocalTextStylesAsync();
+      const filtered = all.filter(s => isBreakpointTypographyStyleName(s.name));
+      const styles = filtered.map(s => snapshotTextStyle(s));
+      const collections = await figma.variables.getLocalVariableCollectionsAsync();
+      const bpColl = collections.find(c => c.name === '.breakpoint') ?? null;
+      const bpModeId = bpColl?.modes[0]?.modeId;
+      if (bpModeId) await enrichBreakpointTextStyleSnapshots(styles, bpModeId);
+      const tokens = await getBreakpointTypographyTokenOptions();
+      const styleGroups = groupTypographyTokensByStyle(tokens);
+      try {
+        figma.ui.postMessage({
+          type: 'WIZARD_BP_TYPO_DATA',
+          styles,
+          tokens,
+          styleGroups,
+          breakpointCollectionModeId: bpModeId ?? '',
+        });
+      } catch (postErr) {
+        figma.ui.postMessage({
+          type: 'WIZARD_ERROR',
+          op: 'bp_typo_fetch',
+          error: `Could not send data to UI (${String(postErr)}). Try a smaller file or fewer variables.`,
+        });
+      }
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'bp_typo_fetch', error: String(err) });
+    }
+    return;
+  }
+
+  // ── WIZARD: Semantic colors (non-.core collections whose COLOR vars can alias .core) ─
+  if (msg.type === 'WIZARD_SEMANTIC_COLORS_FETCH') {
+    const mFetch = msg as { collectionId?: string };
+    try {
+      const collections = await figma.variables.getLocalVariableCollectionsAsync();
+      const coreColl =
+        collections.find(c => c.name === '.core') ?? collections.find(c => c.name === 'core') ?? null;
+      const allVars = await figma.variables.getLocalVariablesAsync();
+      const coreVars = coreColl
+        ? allVars.filter(v => v.variableCollectionId === coreColl.id && v.resolvedType === 'COLOR')
+        : [];
+      const coreOptions: Array<{ id: string; name: string; hex: string | null }> = [];
+      if (coreColl) {
+        sortVariablesLikeFigmaPanel(coreVars, coreColl);
+        const coreModeId = coreColl.modes[0]?.modeId ?? '';
+        for (const v of coreVars) {
+          const hex = (await getVariableColorHexForMode(v, coreModeId)) ?? null;
+          coreOptions.push({ id: v.id, name: v.name || '', hex });
+        }
+      }
+      if (!coreColl) {
+        figma.ui.postMessage({
+          type: 'WIZARD_SEMANTIC_COLORS_DATA',
+          rows: [],
+          semanticCollections: [],
+          selectedCollectionId: '',
+          coreOptions,
+          semanticModeId: '',
+          coreModeId: '',
+          semanticCollectionName: null,
+          coreCollectionName: null,
+          semanticResolutionReason: 'no_core',
+        });
+        return;
+      }
+      const coreCollId = coreColl.id;
+      type CollSummary = {
+        id: string;
+        name: string;
+        colorCount: number;
+        aliasToCoreCount: number;
+      };
+      const candidates: CollSummary[] = [];
+      for (const c of collections) {
+        if (isRemoteCollection(c)) continue;
+        if (isSemanticWizardExcludedCollection(c.name)) continue;
+        if (c.id === coreCollId) continue;
+        const colorVars = allVars.filter(
+          v => v.variableCollectionId === c.id && v.resolvedType === 'COLOR',
+        );
+        if (colorVars.length === 0) continue;
+        const modeId = c.modes[0]?.modeId ?? '';
+        if (!modeId) continue;
+        let aliasToCoreCount = 0;
+        for (const v of colorVars) {
+          if (await isDirectColorAliasToCore(v, modeId, coreCollId)) aliasToCoreCount++;
+        }
+        candidates.push({
+          id: c.id,
+          name: c.name,
+          colorCount: colorVars.length,
+          aliasToCoreCount,
+        });
+      }
+      candidates.sort((a, b) => compareVariablePathName(a.name, b.name));
+      /** Segment tabs: collections with at least one **direct** alias (one hop) into `.core`. */
+      const connectedCollections = candidates.filter(s => s.aliasToCoreCount > 0);
+      if (candidates.length === 0) {
+        figma.ui.postMessage({
+          type: 'WIZARD_SEMANTIC_COLORS_DATA',
+          rows: [],
+          semanticCollections: [],
+          selectedCollectionId: '',
+          coreOptions,
+          semanticModeId: '',
+          coreModeId: coreColl.modes[0]?.modeId ?? '',
+          semanticCollectionName: null,
+          coreCollectionName: coreColl.name,
+          semanticResolutionReason: 'no_semantic_collections',
+        });
+        return;
+      }
+      const requestedId = mFetch.collectionId;
+      function pickDefaultCollectionId(): string {
+        if (requestedId) {
+          if (connectedCollections.some(s => s.id === requestedId)) return requestedId;
+          if (candidates.some(s => s.id === requestedId)) return requestedId;
+        }
+        if (connectedCollections.length > 0) {
+          let best = connectedCollections[0];
+          for (const s of connectedCollections) {
+            if (s.aliasToCoreCount > best.aliasToCoreCount) best = s;
+            else if (
+              s.aliasToCoreCount === best.aliasToCoreCount &&
+              compareVariablePathName(s.name, best.name) < 0
+            ) {
+              best = s;
+            }
+          }
+          return best.id;
+        }
+        return candidates[0].id;
+      }
+      const selectedId = pickDefaultCollectionId();
+      const semanticColl = collections.find(c => c.id === selectedId) ?? null;
+      const semanticModeId = semanticColl?.modes[0]?.modeId ?? '';
+      if (!semanticColl || !semanticModeId) {
+        figma.ui.postMessage({
+          type: 'WIZARD_SEMANTIC_COLORS_DATA',
+          rows: [],
+          semanticCollections: connectedCollections.map(s => ({
+            id: s.id,
+            name: s.name,
+            colorCount: s.colorCount,
+            aliasToCoreCount: s.aliasToCoreCount,
+          })),
+          selectedCollectionId: '',
+          coreOptions,
+          semanticModeId: '',
+          coreModeId: coreColl.modes[0]?.modeId ?? '',
+          semanticCollectionName: null,
+          coreCollectionName: coreColl.name,
+          semanticResolutionReason: 'invalid_selection',
+        });
+        return;
+      }
+      const semanticVars = allVars.filter(
+        v => v.variableCollectionId === semanticColl.id && v.resolvedType === 'COLOR',
+      );
+      sortVariablesLikeFigmaPanel(semanticVars, semanticColl);
+      const rows: Array<{
+        id: string;
+        name: string;
+        selectedCoreId: string | null;
+        connectionChain: string;
+        resolvedHex: string | null;
+      }> = [];
+      // Order matches Figma Variables: same as semanticVars (sorted by name above).
+      for (const v of semanticVars) {
+        const r = await followColorAliasChainToCore(v, semanticModeId, coreCollId, 12);
+        let connectionChain: string;
+        if (r.hasRawPrimitive) connectionChain = 'Raw color (not an alias)';
+        else if (r.chainLabels.length === 0) connectionChain = '—';
+        else if (r.coreTargetId != null) connectionChain = r.chainLabels.join(' → ');
+        else connectionChain = `${r.chainLabels.join(' → ')} (does not end in .core)`;
+        const resolvedHex = (await getVariableColorHexForMode(v, semanticModeId)) ?? null;
+        rows.push({
+          id: v.id,
+          name: v.name || '',
+          selectedCoreId: r.coreTargetId,
+          connectionChain,
+          resolvedHex,
+        });
+      }
+      figma.ui.postMessage({
+        type: 'WIZARD_SEMANTIC_COLORS_DATA',
+        rows,
+        semanticCollections: connectedCollections.map(s => ({
+          id: s.id,
+          name: s.name,
+          colorCount: s.colorCount,
+          aliasToCoreCount: s.aliasToCoreCount,
+        })),
+        selectedCollectionId: selectedId,
+        coreOptions,
+        semanticModeId,
+        coreModeId: coreColl.modes[0]?.modeId ?? '',
+        semanticCollectionName: semanticColl.name,
+        coreCollectionName: coreColl.name,
+        semanticResolutionReason: null,
+      });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'WIZARD_ERROR', op: 'semantic_colors_fetch', error: String(err) });
+    }
+    return;
+  }
+
+  if (msg.type === 'WIZARD_TEXT_STYLE_BIND') {
+    const m = msg as unknown as {
+      styleId: string;
+      field: VariableBindableTextField;
+      variableId: string | null;
+    };
+    try {
+      const style = await figma.getStyleByIdAsync(m.styleId);
+      if (!style || style.type !== 'TEXT') throw new Error('Text style not found');
+      const ts = style as TextStyle;
+      await figma.loadFontAsync(ts.fontName);
+      const variable = m.variableId ? await figma.variables.getVariableByIdAsync(m.variableId) : null;
+      if (m.variableId && !variable) throw new Error('Variable not found');
+      // Snapshot the existing binding so undo can restore it
+      const oldBoundVar = (ts.boundVariables as Record<string, { type: string; id: string } | undefined>)?.[m.field];
+      const oldVarId = oldBoundVar?.id ?? null;
+      _wizSnapshots.push({
+        label: `text-style/${ts.name}/${m.field}`,
+        vars: [],
+        _styleSnap: { styleId: m.styleId, field: m.field as string, variableId: oldVarId },
+      } as unknown as WizUndoSnapshot);
+      if (_wizSnapshots.length > 5) _wizSnapshots.shift();
+      figma.ui.postMessage({ type: 'WIZARD_UNDO_COUNT', count: _wizSnapshots.length });
+      ts.setBoundVariable(m.field, variable);
+      let resolvedDisplay: string | undefined;
+      if (variable) {
+        const cols = await figma.variables.getLocalVariableCollectionsAsync();
+        const bpCol = cols.find(c => c.name === '.breakpoint') ?? null;
+        const modeId = bpCol?.modes[0]?.modeId;
+        if (modeId) resolvedDisplay = await resolveVariableValueDisplay(variable, modeId);
+      }
+      figma.ui.postMessage({
+        type: 'WIZARD_TEXT_STYLE_BOUND',
+        styleId: m.styleId,
+        field: m.field,
+        ok: true,
+        resolvedDisplay,
+      });
+    } catch (err) {
+      figma.ui.postMessage({
+        type: 'WIZARD_TEXT_STYLE_BOUND',
+        styleId: m.styleId,
+        field: m.field,
+        ok: false,
+        error: String(err),
+      });
+    }
+    return;
+  }
+
+  // ── ONBOARDING_LOAD_DRAFT ─────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_LOAD_DRAFT') {
+    try {
+      const draft = await onbLoadDraft();
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_LOADED', draft });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_LOADED', draft: null, error: String(err) });
+    }
+    return;
+  }
+
+  // ── ONBOARDING_SAVE_DRAFT ─────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_SAVE_DRAFT') {
+    try {
+      await onbSaveDraft(msg.draft as OnboardingDraft);
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_SAVED', ok: true });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_SAVED', ok: false, error: String(err) });
+    }
+    return;
+  }
+
+  // ── ONBOARDING_CLEAR_DRAFT ────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_CLEAR_DRAFT') {
+    try {
+      await onbClearDraft();
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_CLEARED', ok: true });
+    } catch (err) {
+      figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_CLEARED', ok: false, error: String(err) });
+    }
+    return;
+  }
+
+  // ── ONBOARDING_NEW_DRAFT ──────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_NEW_DRAFT') {
+    const draft = onbEmptyDraft();
+    figma.ui.postMessage({ type: 'ONBOARDING_DRAFT_LOADED', draft });
+    return;
+  }
+
+  // ── ONBOARDING_DETECT_SYSTEM ──────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_DETECT_SYSTEM') {
+    const cols = await figma.variables.getLocalVariableCollectionsAsync();
+    const info = detectRADDSystem(cols.map(c => c.name));
+    figma.ui.postMessage({
+      type: 'ONBOARDING_SYSTEM_DETECTED',
+      info,
+      label: systemLabel(info),
+      fileName: figma.root.name,
+    });
+    return;
+  }
+
+  // ── ONBOARDING_AUTO_PLACE ─────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_AUTO_PLACE') {
+    const rawInput = typeof msg.input === 'string' ? msg.input : '';
+    const context = typeof msg.context === 'string' ? msg.context : 'primary';
+    const hexes = onbParseHexList(rawInput);
+    try {
+      const result = onbAutoPlace(hexes);
+      figma.ui.postMessage({ type: 'ONBOARDING_AUTO_PLACE_RESULT', context, result });
+    } catch (err) {
+      figma.ui.postMessage({
+        type: 'ONBOARDING_AUTO_PLACE_RESULT',
+        context,
+        result: { slots: [], log: [], unplaced: [] },
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  // ── ONBOARDING_MIRROR_SUGGEST ─────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_MIRROR_SUGGEST') {
+    const d = msg.draft as OnboardingDraft;
+    const suggestions = onbMirrorSuggestions(d?.palette?.primary ?? null);
+    figma.ui.postMessage({ type: 'ONBOARDING_MIRROR_SUGGEST_RESULT', suggestions });
+    return;
+  }
+
+  // ── ONBOARDING_VALIDATE_SEMANTIC ──────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_VALIDATE_SEMANTIC') {
+    const d = msg.draft as OnboardingDraft;
+    const report = onbValidateAll(d?.semanticLight ?? {});
+    figma.ui.postMessage({ type: 'ONBOARDING_VALIDATE_SEMANTIC_RESULT', report });
+    return;
+  }
+
+  // ── ONBOARDING_COMMIT ─────────────────────────────────────────────────────
+  if (msg.type === 'ONBOARDING_COMMIT') {
+    const draft = msg.draft as OnboardingDraft;
+    try {
+      const result = await onbRunCommit(draft, (p: CommitProgress) => {
+        figma.ui.postMessage({ type: 'ONBOARDING_COMMIT_PROGRESS', progress: p });
+      });
+      if (result.success) {
+        await onbClearDraft();
+      }
+      figma.ui.postMessage({ type: 'ONBOARDING_COMMIT_RESULT', result, fileName: figma.root.name });
+    } catch (err) {
+      figma.ui.postMessage({
+        type: 'ONBOARDING_COMMIT_RESULT',
+        result: {
+          success: false,
+          variablesWritten: 0,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        fileName: figma.root.name,
+      });
+    }
     return;
   }
 

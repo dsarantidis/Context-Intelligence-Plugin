@@ -1,5 +1,5 @@
 {
-  "name": "DS Context Intelligence",
+  "name": "Design System Quality Auditor",
   "id": "ds-context-intelligence-mcp",
   "api": "1.0.0",
   "main": "dist/code.js",
